@@ -73,6 +73,7 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.multimodal_utils import attach_initial_nemo_gym_image_payloads
 from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -92,7 +93,6 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
-    attach_initial_nemo_gym_image_payloads,
     backfill_missing_routed_experts,
     get_nemo_gym_thinking_tags,
     run_async_multi_turn_rollout,
@@ -441,24 +441,6 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
-def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
-    """Reject configurations whose media transfer path is not qualified."""
-    if not master_config.grpo.deduplicate_multimodal_data:
-        return
-
-    generation_config = master_config.policy["generation"]
-    if generation_config.get("backend") != "vllm":
-        raise NotImplementedError(
-            "grpo.deduplicate_multimodal_data=true is currently qualified "
-            "only with policy.generation.backend=vllm."
-        )
-    if (master_config.data_plane or {}).get("enabled", False):
-        raise NotImplementedError(
-            "grpo.deduplicate_multimodal_data=true is currently supported "
-            "only when data_plane.enabled=false."
-        )
-
-
 def _needs_hf_refit_handshake(
     generation_backend: str,
     nccl_reshard_refit_enabled: bool,
@@ -525,8 +507,6 @@ def setup(
     if generation_config["backend"] == "vllm":
         configure_vllm_mm_cache_reset_policy(cast(dict[str, Any], policy_config))
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
-    _validate_multimodal_dedup_capability(master_config)
-
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
     val_sampling_overridden = (
@@ -4309,12 +4289,15 @@ def async_grpo_train(
     colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
     stop_at_validation_threshold = master_config.grpo.stop_at_validation_threshold
     stop_at_validation_metric = master_config.grpo.stop_at_validation_metric
+    assert (not colocated_inference) or (
+        isinstance(policy_generation, MegatronGeneration)
+    ), (
+        "Colocated async GRPO is only supported for the Megatron generation "
+        "backend."
+    )
+
     # Initialize advantage estimator
     adv_estimator = _create_advantage_estimator(master_config)
-
-    assert not colocated_inference, (
-        "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
-    )
 
     # Calculate minimum buffer size from training requirements
     # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt

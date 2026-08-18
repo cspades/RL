@@ -47,12 +47,21 @@ class MCoreGenerationSpecificArgs(TypedDict):
     materialize_only_last_token_logits: bool
     enable_chunked_prefill: bool
     enable_prefix_caching: bool
+    async_sched_mode: NotRequired[Literal["legacy", "async"]]
+    vision_embedding_cache_max_bytes: NotRequired[int]
+    logprobs_mode: NotRequired[Literal["raw_logprobs", "processed_logprobs"]]
 
     refit_backend: Literal["gloo", "nccl", "nvshmem"]
     num_speculative_tokens: int
 
     mamba_inference_ssm_states_dtype: NotRequired[str]
     mamba_inference_conv_states_dtype: NotRequired[str]
+
+    # Raw media preprocessing used by the OpenAI-compatible HTTP endpoint.
+    video_num_frames: NotRequired[int]
+    video_temporal_patch_size: NotRequired[int]
+    video_target_num_patches: NotRequired[int]
+    multimodal_prompt_config: NotRequired[dict]
 
     # KV cache lifecycle across suspend/resume:
     # - "persist": cache stays allocated; CUDA graphs remain valid (default)
@@ -64,6 +73,9 @@ class MCoreGenerationSpecificArgs(TypedDict):
     kv_cache_management_mode: Literal["persist", "offload"]
 
     logging_step_interval: NotRequired[int]
+
+    # Merged into megatron_cfg for gen workers; required for EP>1 + local CUDA graphs.
+    moe_pad_experts_for_cuda_graph_inference: NotRequired[bool]
 
 
 class MCoreGenerationConfig(GenerationConfig):

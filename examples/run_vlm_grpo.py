@@ -86,6 +86,7 @@ def main() -> None:
         init_ray()
 
     with rl_init_timer.time("tokenizer"):
+        config.policy["is_vlm"] = True
         processor = get_tokenizer(config.policy["tokenizer"], get_processor=True)
     tokenizer = processor.tokenizer
 
@@ -95,7 +96,8 @@ def main() -> None:
     config.policy["generation"] = configure_generation_config(
         config.policy["generation"], processor.tokenizer
     )
-    if "vllm_cfg" in config.policy["generation"]:
+    generation_backend = config.policy["generation"].get("backend")
+    if generation_backend == "vllm":
         assert (
             config.policy["generation"]["vllm_cfg"]["skip_tokenizer_init"] == False
         ), (
@@ -133,21 +135,72 @@ def main() -> None:
             print(f"  {label}: {value:.1f}s")
     print("=" * 60 + "\n", flush=True)
 
-    grpo_train(
-        policy,
-        policy_generation,
-        dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        task_to_env,
-        val_task_to_env,
-        logger,
-        checkpointer,
-        grpo_state,
-        master_config,
-        processor=processor,
-    )
+    if config.grpo.async_grpo.enabled:
+        if (
+            config.policy["generation"]["colocated"]["enabled"]
+            and generation_backend != "megatron"
+        ):
+            raise ValueError(
+                "Colocated async GRPO is only supported for the Megatron "
+                "generation backend. Use backend=megatron, or disable "
+                "policy.generation.colocated.enabled / grpo.async_grpo.enabled."
+            )
+        if generation_backend not in ("megatron", "vllm", "trtllm"):
+            raise ValueError(
+                f"Async multimodal GRPO requires generation backend "
+                f"megatron, vllm, or trtllm (got {generation_backend!r})."
+            )
+        if config.grpo.use_dynamic_sampling:
+            raise NotImplementedError(
+                "use_dynamic_sampling is not supported with async GRPO"
+            )
+        if config.grpo.reward_scaling.enabled:
+            raise NotImplementedError("reward_scaling is not supported with async GRPO")
+        if config.grpo.reward_shaping.enabled:
+            raise NotImplementedError("reward_shaping is not supported with async GRPO")
+        if config.data["use_multiple_dataloader"]:
+            raise NotImplementedError(
+                "use_multiple_dataloader is not supported with async GRPO"
+            )
+
+        from nemo_rl.algorithms.grpo import async_grpo_train
+
+        print("🚀 Running async multimodal GRPO training")
+        async_grpo_train(
+            policy=policy,
+            policy_generation=policy_generation,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            grpo_save_state=grpo_state,
+            master_config=master_config,
+            max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
+            teacher_worker_groups=_teacher_worker_groups,
+            alias_to_group_alias=_alias_to_group_alias,
+            processor=processor,
+        )
+    else:
+        print("🚀 Running synchronous multimodal GRPO training")
+        grpo_train(
+            policy,
+            policy_generation,
+            dataloader,
+            val_dataloader,
+            tokenizer,
+            loss_fn,
+            task_to_env,
+            val_task_to_env,
+            logger,
+            checkpointer,
+            grpo_state,
+            master_config,
+            processor=processor,
+        )
 
 
 if __name__ == "__main__":

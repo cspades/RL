@@ -16,7 +16,7 @@ import copy
 import json
 import os
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import torch
@@ -25,34 +25,23 @@ from PIL import Image
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
+    build_media_cache_key,
     extract_multimodal_model_inputs,
     get_dim_to_pack_along,
+    reattach_static_multimodal_payload,  # noqa: F401 - compatibility re-export
     resolve_to_image,
+)
+from nemo_rl.data.video_utils import (
+    build_cached_video_frame_data_url,
+    load_video_frames_with_metadata,
 )
 from nemo_rl.environments.nemotron_utils import (
     NEMOTRON_VIDEO_PROCESSOR_NAMES,
     process_nemotron_video_frames,
 )
-from nemo_rl.models.generation.vllm.video_utils import (
-    build_cached_video_frame_data_url,
-    load_video_frames_with_metadata,
-)
-
-
 _VIDEO_CONTENT_TYPES = {"input_video", "video", "video_url"}
 _IMAGE_CONTENT_TYPES = {"input_image", "image", "image_url"}
 _AUDIO_CONTENT_TYPES = {"input_audio", "audio", "audio_url"}
-_VideoConfigValue = TypeVar("_VideoConfigValue")
-
-
-def _require_video_config_value(
-    value: _VideoConfigValue | None, field_name: str
-) -> _VideoConfigValue:
-    if value is None:
-        raise ValueError(
-            f"Gym video preprocessing requires data.{field_name} to be configured."
-        )
-    return value
 
 
 def _get_content_part_url(part: dict[str, Any], *keys: str) -> str:
@@ -562,38 +551,23 @@ def nemo_gym_example_to_video_datum_spec(
     task_name: str,
     data_config: TaskDataSpec | None = None,
 ) -> dict[str, Any] | None:
-    """Preprocess static Gym video with vLLM-equivalent frame sampling.
-
-    The raw video remains in the outbound Gym request. Cached frames are sent as
-    one native-video manifest so vLLM consumes the same lossless RGB frames as
-    policy preprocessing. Those tensors are reattached to vLLM-authored prompt
-    token IDs after the rollout.
-    """
+    """Preprocess a static Gym video."""
     extracted = _extract_static_video_messages(nemo_gym_example)
     if extracted is None:
         return None
     hf_messages, video_path = extracted
 
-    if data_config is None:
-        raise ValueError("Gym video preprocessing requires a data configuration.")
-    num_frames = int(_require_video_config_value(data_config.num_frames, "num_frames"))
-    temporal_patch_size = int(
-        _require_video_config_value(
-            data_config.video_temporal_patch_size,
-            "video_temporal_patch_size",
-        )
+    num_frames = int(data_config.num_frames or 8) if data_config else 8
+    temporal_patch_size = (
+        int(data_config.video_temporal_patch_size or 1) if data_config else 1
     )
-    maintain_aspect_ratio = bool(
-        _require_video_config_value(
-            data_config.video_maintain_aspect_ratio,
-            "video_maintain_aspect_ratio",
-        )
+    maintain_aspect_ratio = (
+        True
+        if data_config is None or data_config.video_maintain_aspect_ratio is None
+        else bool(data_config.video_maintain_aspect_ratio)
     )
-    min_generation_tokens = int(
-        _require_video_config_value(
-            data_config.min_generation_tokens,
-            "min_generation_tokens",
-        )
+    min_generation_tokens = (
+        int(data_config.min_generation_tokens or 2000) if data_config else 2000
     )
     if video_path is not None:
         frame_items, _video_metadata = _video_to_image_content(
@@ -625,7 +599,9 @@ def nemo_gym_example_to_video_datum_spec(
             raise ValueError("Cached Gym video preprocessing received no frames.")
 
     template_kwargs = _chat_template_kwargs_for_processor(nemo_gym_example)
-    video_target_num_patches = data_config.video_target_num_patches
+    video_target_num_patches = (
+        data_config.video_target_num_patches if data_config else None
+    )
     if type(processor).__name__ in NEMOTRON_VIDEO_PROCESSOR_NAMES:
         if video_target_num_patches is None:
             raise ValueError(
@@ -671,6 +647,33 @@ def nemo_gym_example_to_video_datum_spec(
         "content": "",
         "token_ids": processed["input_ids"][0],
     }
+    cache_media_sources: list[tuple[str, Any]] = (
+        [("video", video_path)]
+        if video_path is not None
+        else [
+            (
+                "image",
+                part["image"]
+                if part.get("image") is not None
+                else part.get("image_url"),
+            )
+            for part in frame_items
+            if part.get("image") is not None or part.get("image_url") is not None
+        ]
+    )
+    if cache_media_sources:
+        media_cache_key = build_media_cache_key(
+            cache_media_sources,
+            settings={
+                "num_frames": num_frames,
+                "temporal_patch_size": temporal_patch_size,
+                "target_num_patches": video_target_num_patches,
+                "maintain_aspect_ratio": maintain_aspect_ratio,
+                "processor": type(processor).__name__,
+            },
+        )
+        if media_cache_key is not None:
+            user_message["media_cache_key"] = media_cache_key
     if "imgs_sizes" in processed and "num_frames" not in processed:
         processed["num_frames"] = torch.tensor([len(frame_items)], dtype=torch.int32)
     user_message.update(extract_multimodal_model_inputs(processor, processed))
@@ -720,27 +723,3 @@ def nemo_gym_example_to_video_datum_spec(
         "idx": idx,
         "task_name": task_name,
     }
-
-
-def reattach_static_multimodal_payload(
-    target_message_log: list[dict[str, Any]],
-    source_message_log: list[dict[str, Any]] | None,
-) -> None:
-    """Attach driver-side PackedTensor payloads to the first rollout user turn."""
-    if not source_message_log:
-        return
-    payload = {
-        key: value
-        for message in source_message_log
-        for key, value in message.items()
-        if isinstance(value, PackedTensor)
-    }
-    if not payload:
-        return
-    for message in target_message_log:
-        if message.get("role") == "user":
-            message.update(payload)
-            return
-    raise ValueError(
-        "Cannot attach the static multimodal payload: Gym returned no user message."
-    )

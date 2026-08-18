@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -40,6 +40,8 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
+    build_generation_input_from_message_logs,
+    get_media_cache_keys_from_message_logs,
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
@@ -47,7 +49,8 @@ from nemo_rl.data.multimodal_utils import (
     VLLM_MULTIMODAL_DATA_KEYS,
     PackedTensor,
     attach_image_model_inputs_to_message,
-    extract_input_images_from_responses_messages,
+    attach_initial_nemo_gym_image_payloads as _attach_initial_nemo_gym_image_payloads,
+    reattach_static_multimodal_payload,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import (
@@ -55,7 +58,6 @@ from nemo_rl.environments.interfaces import (
     EnvironmentReturn,
 )
 from nemo_rl.environments.nemo_gym import DEFAULT_THINKING_TAGS
-from nemo_rl.environments.nemo_gym_video import reattach_static_multimodal_payload
 from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.models.generation.interfaces import (
@@ -79,43 +81,12 @@ def attach_initial_nemo_gym_image_payloads(
     batch: BatchedDataDict[DatumSpec],
     processor: Any,
 ) -> None:
-    """Attach initial Gym image tensors once, before prompt repeat.
-
-    The NeMo Gym dataset deliberately carries only the Responses request in
-    ``extra_env_info``. Dedup-enabled GRPO calls this helper on the unrepeated
-    prompt batch, allowing ``repeat_interleave(..., share_immutable_media=True)``
-    to retain one physical processor output per prompt. Flag-off runs never call
-    this helper.
-    """
-    for message_log, extra_env_info in zip(
-        batch["message_log"], batch["extra_env_info"]
-    ):
-        if extra_env_info is None or not isinstance(extra_env_info, dict):
-            continue
-        initial_messages = extra_env_info.get("responses_create_params", {}).get(
-            "input", []
-        )
-        images = extract_input_images_from_responses_messages(initial_messages)
-        if not images:
-            continue
-        if processor is None or getattr(processor, "image_processor", None) is None:
-            raise ValueError(
-                "NeMo Gym image deduplication requires the multimodal processor "
-                "to be passed to GRPO."
-            )
-        user_message = next(
-            (message for message in message_log if message.get("role") == "user"),
-            None,
-        )
-        if user_message is None:
-            raise ValueError("NeMo Gym image prompt has no user message to attach to.")
-        if isinstance(user_message.get("pixel_values"), PackedTensor):
-            continue
-        attach_image_model_inputs_to_message(
-            user_message,
-            images=images,
-            processor=processor,
-        )
+    """Compatibility adapter for the canonical multimodal data helper."""
+    _attach_initial_nemo_gym_image_payloads(
+        batch,
+        processor,
+        _attach_model_inputs=attach_image_model_inputs_to_message,
+    )
 
 
 def _add_multimodal_generation_payload(
@@ -126,14 +97,15 @@ def _add_multimodal_generation_payload(
     *,
     deduplicate_multimodal_data: bool,
 ) -> None:
-    """Attach one policy-ready or native-vLLM media representation.
-
-    The compact policy representation remains in ``message_log`` for later
-    logprob/training construction. When every active row has a native vLLM
-    prompt, sending that representation as well is redundant.
-    """
+    """Attach one policy-ready or native-vLLM media representation."""
     generation_config = getattr(policy_generation, "cfg", {})
     native_content = active_batch.get("vllm_content")
+    message_logs = active_batch.get("message_log")
+    if message_logs is not None:
+        generation_input_data["message_log"] = message_logs
+        media_cache_keys = get_media_cache_keys_from_message_logs(message_logs)
+        if any(key is not None for key in media_cache_keys):
+            generation_input_data["media_cache_key"] = media_cache_keys
 
     def row_has_formatter_consumed_media(row_index: int) -> bool:
         for key in VLLM_MULTIMODAL_DATA_KEYS:
@@ -173,14 +145,7 @@ def _reattach_original_multimodal_payloads(
     results: list[dict[str, Any]],
     original_message_logs: list[LLMMessageLogType | VLMMessageLogType],
 ) -> None:
-    """Restore exact prompt media omitted by a remote Gym rollout.
-
-    User turns are matched by their ordinal position. Only explicit
-    ``PackedTensor`` values and named native-generation media are restored, so
-    arbitrary non-text metadata is never misclassified as media. Newly returned
-    Gym media is left untouched unless it occupies the corresponding original
-    prompt key.
-    """
+    """Restore exact prompt media omitted by a remote Gym rollout."""
     for result, original_log in zip(results, original_message_logs):
         if not result.pop("_initial_multimodal_data_omitted", False):
             continue
@@ -533,9 +498,7 @@ async def generate_responses_async(
         generation_input_data["stop_strings"] = [None] * len(input_lengths)
 
     # Check if this is a supported inference engine with async generation enabled.
-    # SGLang exposes ``sglang_cfg`` and gates on ``use_async_rollouts``;
-    # vLLM exposes ``cfg`` and gates on ``vllm_cfg.async_engine``;
-    # TRT-LLM requires its flag; the Megatron backend is always async.
+    # SGLang and vLLM retain explicit async flags; Megatron is always async.
     vllm_cfg = getattr(policy_generation, "cfg", None)
     sglang_cfg = getattr(policy_generation, "sglang_cfg", None)
     generation_config = vllm_cfg or sglang_cfg or {}
@@ -554,7 +517,6 @@ async def generate_responses_async(
         )
         use_async_generation = True
     elif backend == "megatron":
-        # The Megatron backend always uses the async engine.
         use_async_generation = True
     else:
         use_async_generation = False
@@ -562,8 +524,8 @@ async def generate_responses_async(
     assert use_async_generation and hasattr(policy_generation, "generate_async"), (
         "Async generation is not enabled. For SGLang, set "
         "policy.generation.use_async_rollouts=True. For vLLM, set "
-        "policy.generation.vllm_cfg.async_engine=True. The "
-        "generation backend must also implement generate_async."
+        "policy.generation.vllm_cfg.async_engine=True. The generation backend "
+        "must also implement generate_async."
     )
 
     # Use async generation with per-sample streaming
@@ -818,9 +780,8 @@ def run_multi_turn_rollout(
         max_rollout_turns: Maximum number of agent-environment interaction turns.
         max_seq_len: Maximum sequence length allowed.
         greedy: Whether to use greedy decoding.
-        deduplicate_multimodal_data: Send only native media through the vLLM
-            generation boundary while retaining compact policy media for
-            logprob and training.
+        deduplicate_multimodal_data: Prefer native vLLM media at generation
+            boundaries while retaining packed media for policy training.
 
     Returns:
         Tuple containing:
@@ -859,25 +820,17 @@ def run_multi_turn_rollout(
 
         # Convert LLMMessageLogType to FlatMessagesType for generation
         active_batch = current_batch.select_indices(active_indices)
-        if turn > 0 and "vllm_content" in active_batch:
-            active_batch["vllm_content"] = [None] * len(active_indices)
         active_stop_strings = [current_stop_strings[i] for i in active_indices.tolist()]
 
-        active_flat_messages: BatchedDataDict[FlatMessagesType]
         active_flat_messages, active_input_lengths = (
             batched_message_log_to_flat_message(
                 active_batch["message_log"],
                 pad_value_dict={"token_ids": tokenizer.pad_token_id},
             )
         )
-
-        # Extract input_ids and lengths from the flat messages
-        active_input_ids = active_flat_messages["token_ids"]
-
-        # Prepare generation input data
         generation_input_data = BatchedDataDict[GenerationDatumSpec](
             {
-                "input_ids": active_input_ids,
+                "input_ids": active_flat_messages["token_ids"],
                 "input_lengths": active_input_lengths,
                 "stop_strings": active_stop_strings,
             }
@@ -1068,25 +1021,19 @@ async def async_generate_response_for_sample_turn(
         tokenizer: Tokenizer to use
         max_seq_len: Maximum sequence length
         greedy: Whether to use greedy decoding
-        sample_multimodal_data: Native vLLM media fields for this sample.
-        deduplicate_multimodal_data: Avoid sending both native and policy-ready
-            media through the async generation boundary.
+        sample_multimodal_data: Native generation media fields for this sample.
+        deduplicate_multimodal_data: Avoid sending both native and packed media.
 
     Returns:
         Tuple of (updated_message_log, generated_tokens, input_lengths, generation_metrics)
     """
-    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-
     # Convert single sample to batch format
     batch_message_logs = [sample_message_log]
 
-    # Convert to flat format for generation
     flat_messages, input_lengths = batched_message_log_to_flat_message(
         batch_message_logs,
         pad_value_dict={"token_ids": tokenizer.pad_token_id},
     )
-
-    # Create generation input
     generation_input_data = BatchedDataDict[GenerationDatumSpec](
         {
             "input_ids": flat_messages["token_ids"],
@@ -1155,8 +1102,6 @@ async def run_sample_multi_turn_rollout(
         max_seq_len: Maximum sequence length
         max_rollout_turns: Maximum number of turns
         greedy: Whether to use greedy decoding
-        deduplicate_multimodal_data: Avoid redundant media at generation
-            boundaries while preserving compact policy media in the trajectory.
 
     Returns:
         Tuple of (final_sample_state, sample_metrics)
@@ -1203,7 +1148,6 @@ async def run_sample_multi_turn_rollout(
             if turn > 0 and "vllm_content" in sample_multimodal_data:
                 turn_multimodal_data = dict(sample_multimodal_data)
                 turn_multimodal_data["vllm_content"] = None
-
             (
                 updated_message_log,
                 generated_tokens,
@@ -2271,10 +2215,9 @@ async def run_async_nemo_gym_rollout(
         sampling_params: Sampling profile stamped onto every NeMo-Gym row.
             ``None`` uses the train profile from ``generation_config``;
             validation passes its own profile explicitly.
-        deduplicate_multimodal_data: Omit initial policy-ready media from the
-            remote Gym return and restore the exact original payload locally.
-        debug_payload_metrics: Emit logical, physical, and serialized media
-            payload metrics at the Gym Ray boundary.
+        deduplicate_multimodal_data: Omit static media from Gym responses and
+            restore it from the input message logs on the driver.
+        debug_payload_metrics: Measure payloads at Gym Ray boundaries.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2396,10 +2339,6 @@ async def run_async_nemo_gym_rollout(
                     stream_finished = True
                 else:
                     rowidx, result, timing_metrics = await future
-                    # Measure the received streaming Ray value in the caller. In
-                    # async training this runs in the collector actor; validation
-                    # runs in the driver, so the two phases cannot share a metric
-                    # accumulator even when they share the NeMo-Gym actor.
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             (rowidx, result, timing_metrics),
@@ -2414,7 +2353,10 @@ async def run_async_nemo_gym_rollout(
 
                 _tensorize_nemo_gym_result(result)
                 completed_group = accumulator.add(rowidx, result)
-                if original_message_logs is not None:
+                initial_media_omitted = bool(
+                    result.get("_initial_multimodal_data_omitted")
+                )
+                if original_message_logs is not None and not initial_media_omitted:
                     reattach_static_multimodal_payload(
                         result["message_log"], original_message_logs[rowidx]
                     )
@@ -2508,9 +2450,9 @@ def run_nemo_gym_rollout_sync(
             validation passes its own profile explicitly.
         mask_env_flagged_samples: Whether to carry env-driven ``mask_sample``
             flags in the rollout batch for loss masking.
-        deduplicate_multimodal_data: Omit initial policy-ready media from the
-            remote Gym return and restore it from the input batch.
-        debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
+        deduplicate_multimodal_data: Omit static media from Gym responses and
+            restore it from the input message logs on the driver.
+        debug_payload_metrics: Measure payloads at Gym Ray boundaries.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.

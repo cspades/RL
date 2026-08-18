@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,15 +13,20 @@
 # limitations under the License.
 
 import base64
+import hashlib
 import inspect
+import json
 import logging
+import os
 import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional, Union
 
+import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
@@ -33,7 +38,17 @@ from transformers.video_utils import load_video
 VLLM_MULTIMODAL_DATA_KEYS = frozenset({"vllm_images", "vllm_videos", "vllm_audios"})
 NATIVE_MULTIMODAL_KEYS = frozenset({"vllm_content", *VLLM_MULTIMODAL_DATA_KEYS})
 MULTIMODAL_CONTENT_TYPES = frozenset(
-    {"input_image", "image", "image_url", "video", "audio"}
+    {
+        "input_image",
+        "image",
+        "image_url",
+        "input_video",
+        "video",
+        "video_url",
+        "input_audio",
+        "audio",
+        "audio_url",
+    }
 )
 
 # List of allowed placeholder strings for different media types in the dataset string
@@ -45,6 +60,92 @@ MEDIA_TAGS = {
     "video-audio": "<video-audio>",
 }
 MEDIA_TAGS_REVERSED = {v: k for k, v in MEDIA_TAGS.items()}
+
+
+def build_media_cache_key(
+    media_sources: list[tuple[str, Any]],
+    *,
+    settings: Optional[dict[str, Any]] = None,
+) -> Optional[str]:
+    """Build a stable media cache key, or return ``None`` if unsupported."""
+
+    unsupported = object()
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, os.PathLike):
+            value = os.fspath(value)
+        if isinstance(value, str):
+            path = Path(value)
+            try:
+                stat = path.stat() if path.is_file() else None
+            except OSError:
+                stat = None
+            return {
+                "value": value,
+                "size": stat.st_size if stat is not None else None,
+                "mtime_ns": stat.st_mtime_ns if stat is not None else None,
+            }
+        if isinstance(value, (bytes, bytearray)):
+            return {"sha256": hashlib.sha256(bytes(value)).hexdigest()}
+        if isinstance(value, Image.Image):
+            digest = hashlib.sha256()
+            digest.update(value.mode.encode())
+            digest.update(str(value.size).encode())
+            digest.update(value.tobytes())
+            return {"sha256": digest.hexdigest()}
+        if isinstance(value, np.ndarray):
+            contiguous = np.ascontiguousarray(value)
+            digest = hashlib.sha256()
+            digest.update(str(contiguous.dtype).encode())
+            digest.update(str(contiguous.shape).encode())
+            digest.update(contiguous.tobytes())
+            return {"sha256": digest.hexdigest()}
+        if torch.is_tensor(value):
+            contiguous = value.detach().cpu().contiguous()
+            digest = hashlib.sha256()
+            digest.update(str(contiguous.dtype).encode())
+            digest.update(str(tuple(contiguous.shape)).encode())
+            digest.update(contiguous.view(torch.uint8).numpy().tobytes())
+            return {"sha256": digest.hexdigest()}
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, (list, tuple)):
+            normalized = [normalize(item) for item in value]
+            return (
+                unsupported if any(item is unsupported for item in normalized) else normalized
+            )
+        if isinstance(value, dict):
+            normalized = {str(key): normalize(item) for key, item in value.items()}
+            return (
+                unsupported
+                if any(item is unsupported for item in normalized.values())
+                else normalized
+            )
+        return unsupported
+
+    normalized_sources = []
+    for modality, source in media_sources:
+        normalized_source = normalize(source)
+        if normalized_source is unsupported:
+            return None
+        normalized_sources.append({"modality": modality, "source": normalized_source})
+    if not normalized_sources:
+        return None
+
+    normalized_settings = normalize(settings or {})
+    if normalized_settings is unsupported:
+        return None
+    payload = json.dumps(
+        {
+            "version": 1,
+            "media": normalized_sources,
+            "settings": normalized_settings,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
 
 DEFAULT_MEDIA_EXTENSIONS = {
     "image": ["png", "jpeg", "jpg", "img"],
@@ -747,7 +848,7 @@ def get_pad_to_max_shape(processor: Any, key: str) -> bool:
 def extract_multimodal_model_inputs(
     processor: Any, processed: dict[str, Any]
 ) -> dict[str, PackedTensor | torch.Tensor]:
-    """Extract packed media inputs and sequence-aligned auxiliary tensors."""
+    """Extract processor outputs for policy and generation."""
     processed = dict(processed)
     if (
         uses_image_placeholder(processor)
@@ -910,6 +1011,31 @@ def extract_input_image_sources_from_responses_messages(
     return sources
 
 
+def extract_input_video_sources_from_responses_messages(messages: Any) -> list[Any]:
+    """Extract video sources from Responses-API messages in encounter order."""
+    if not isinstance(messages, list):
+        return []
+
+    sources: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content") or []
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") not in ("input_video", "video", "video_url"):
+                continue
+            source = part.get("video") or part.get("video_url") or part.get("url")
+            if isinstance(source, dict):
+                source = source.get("url")
+            if source is not None:
+                sources.append(source)
+    return sources
+
+
 def extract_input_images_from_responses_messages(
     messages: Any,
 ) -> list[Image.Image]:
@@ -923,21 +1049,9 @@ def extract_input_images_from_responses_messages(
 def _materialize_ragged_pixel_values(
     processed: dict[str, Any], processor: Any
 ) -> dict[str, Any]:
-    """Fold a ragged per-image ``pixel_values`` list into one padded tensor.
-
-    Processors with dynamic per-image resolution return a list of CHW tensors
-    rather than a stacked batch. ``imgs_sizes`` is derived from the *unpadded*
-    shapes first, since those exact sizes are what the projector slices with;
-    padding happens afterwards so downstream sees the single tensor its
-    torch.Tensor contract expects.
-    """
+    """Fold ragged per-image pixel values into one padded tensor."""
     processed = dict(processed)
     pixel_values = processed.get("pixel_values")
-
-    # pixel_values is only ragged when the images genuinely differ in size; two
-    # images of equal resolution come back already stacked. Either way the rest
-    # of the batch still needs restoring to tensors, so that runs below rather
-    # than behind this branch.
     if isinstance(pixel_values, list):
         tiles = [torch.as_tensor(item) for item in pixel_values]
         if not tiles or any(item.ndim != 3 for item in tiles):
@@ -946,40 +1060,19 @@ def _materialize_ragged_pixel_values(
             )
         if len({item.shape[0] for item in tiles}) != 1:
             raise ValueError("Ragged pixel_values must use the same channel count.")
-        _stack_ragged_pixel_values(processed, tiles, processor)
+        if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
+            processed["imgs_sizes"] = torch.tensor(
+                [[int(item.shape[-2]), int(item.shape[-1])] for item in tiles],
+                dtype=torch.long,
+            )
+        stacked = PackedTensor(
+            [item.unsqueeze(0) for item in tiles],
+            dim_to_pack=0,
+            pad_to_max_shape=True,
+        ).as_tensor()
+        assert stacked is not None
+        processed["pixel_values"] = stacked
 
-    _restore_tensors(processed)
-    return processed
-
-
-def _stack_ragged_pixel_values(
-    processed: dict[str, Any], tiles: list[torch.Tensor], processor: Any
-) -> None:
-    """Derive imgs_sizes from unpadded shapes, then pad into one tensor."""
-    if uses_image_placeholder(processor) and "imgs_sizes" not in processed:
-        processed["imgs_sizes"] = torch.tensor(
-            [[int(item.shape[-2]), int(item.shape[-1])] for item in tiles],
-            dtype=torch.long,
-        )
-    stacked = PackedTensor(
-        [item.unsqueeze(0) for item in tiles],
-        dim_to_pack=0,
-        pad_to_max_shape=True,
-    ).as_tensor()
-    assert stacked is not None
-    processed["pixel_values"] = stacked
-
-
-def _restore_tensors(processed: dict[str, Any]) -> None:
-    """Convert a processor's list outputs back to tensors, in place.
-
-    ``return_tensors=None`` makes the processor hand back *every* output as
-    plain Python lists, not only the ragged ``pixel_values`` that mode was
-    requested for. Downstream expects tensors -- ``input_ids`` in particular is
-    rank-checked -- so restore the rest of the batch to what
-    ``return_tensors="pt"`` would have produced. Values that resist conversion
-    (genuinely ragged per-image metadata) are left for their own handling.
-    """
     for key, value in processed.items():
         if key == "pixel_values" or isinstance(value, torch.Tensor):
             continue
@@ -988,6 +1081,7 @@ def _restore_tensors(processed: dict[str, Any]) -> None:
                 processed[key] = torch.as_tensor(value)
             except (TypeError, ValueError, RuntimeError):
                 continue
+    return processed
 
 
 def attach_image_model_inputs_to_message(
@@ -1002,17 +1096,14 @@ def attach_image_model_inputs_to_message(
         return
 
     image_token = getattr(processor, "image_token", "<image>")
-    # Processors that emit dynamic per-image resolutions return a ragged CHW list
-    # for heterogeneous multi-image turns. Asking BatchFeature for PT tensors
-    # would make it stack those and fail before the exact imgs_sizes are read off
-    # them. Off by default, so every other caller keeps the stacked path.
     allow_ragged_output = pad_dynamic_image_shapes and len(images) > 1
-    processed = processor(
-        text=image_token * len(images),
-        images=images,
-        return_tensors=None if allow_ragged_output else "pt",
+    processed = dict(
+        processor(
+            text=image_token * len(images),
+            images=images,
+            return_tensors=None if allow_ragged_output else "pt",
+        )
     )
-    processed = dict(processed)
     if allow_ragged_output:
         processed = _materialize_ragged_pixel_values(processed, processor)
     model_inputs = extract_multimodal_model_inputs(processor, processed)
@@ -1023,31 +1114,139 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
+    media_cache_key = build_media_cache_key(
+        [("image", image) for image in images],
+        settings={"processor": type(processor).__name__},
+    )
+    if media_cache_key is not None:
+        message["media_cache_key"] = media_cache_key
 
 
-def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
-    """Replace local image paths in NeMo Gym examples with base64 data URLs.
+def attach_initial_nemo_gym_image_payload(
+    message_log: list[dict[str, Any]],
+    extra_env_info: Any,
+    processor: Any,
+    *,
+    _attach_model_inputs: Any = None,
+) -> None:
+    """Attach one Gym prompt's initial image tensors before prompt repetition."""
+    if extra_env_info is None or not isinstance(extra_env_info, dict):
+        return
+    initial_messages = extra_env_info.get("responses_create_params", {}).get(
+        "input", []
+    )
+    images = extract_input_images_from_responses_messages(initial_messages)
+    if not images:
+        return
+    if processor is None or getattr(processor, "image_processor", None) is None:
+        raise ValueError(
+            "NeMo Gym image deduplication requires the multimodal processor "
+            "to be passed to GRPO."
+        )
+    user_message = next(
+        (message for message in message_log if message.get("role") == "user"),
+        None,
+    )
+    if user_message is None:
+        raise ValueError("NeMo Gym image prompt has no user message to attach to.")
+    if isinstance(user_message.get("pixel_values"), PackedTensor):
+        return
+    attach_model_inputs = _attach_model_inputs or attach_image_model_inputs_to_message
+    attach_model_inputs(
+        user_message,
+        images=images,
+        processor=processor,
+    )
 
-    Walks each example's ``responses_create_params.input[].content[]`` items
-    and rewrites any ``input_image`` part whose ``image_url`` is a local path
-    (or ``file://`` URL) into a base64 ``data:`` URL via
-    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
-    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
-    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
-    without raising.
 
-    The examples are mutated in place; the same list is also returned for
-    convenience so callers can chain the call.
+def attach_initial_nemo_gym_image_payloads(
+    batch: Any,
+    processor: Any,
+    *,
+    _attach_model_inputs: Any = None,
+) -> None:
+    """Attach initial Gym image tensors once, before prompt repetition."""
+    for message_log, extra_env_info in zip(
+        batch["message_log"], batch["extra_env_info"]
+    ):
+        attach_initial_nemo_gym_image_payload(
+            message_log,
+            extra_env_info,
+            processor,
+            _attach_model_inputs=_attach_model_inputs,
+        )
 
-    Args:
-        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
-            expected to contain a ``responses_create_params`` mapping with an
-            ``input`` list of Responses API messages.
 
-    Returns:
-        The same ``nemo_gym_examples`` list, with local image references
-        rewritten to base64 data URLs in place.
-    """
+def reattach_static_multimodal_payload(
+    target_message_log: list[dict[str, Any]],
+    source_message_log: list[dict[str, Any]] | None,
+) -> None:
+    """Restore packed media and its cache identity after a Gym round trip."""
+    if not source_message_log:
+        return
+    payload: dict[str, Any] = {
+        key: value
+        for message in source_message_log
+        for key, value in message.items()
+        if isinstance(value, PackedTensor)
+    }
+    source_cache_keys = [
+        message["media_cache_key"]
+        for message in source_message_log
+        if isinstance(message.get("media_cache_key"), str)
+    ]
+    if len(source_cache_keys) == 1:
+        payload["media_cache_key"] = source_cache_keys[0]
+    if not payload:
+        return
+    for message in target_message_log:
+        if message.get("role") == "user":
+            message.update(payload)
+            return
+    raise ValueError(
+        "Cannot attach the static multimodal payload: Gym returned no user message."
+    )
+
+
+_VIDEO_EXT_TO_MIME = {
+    ".mp4": "mp4",
+    ".m4v": "mp4",
+    ".mov": "quicktime",
+    ".webm": "webm",
+    ".mkv": "x-matroska",
+    ".avi": "x-msvideo",
+}
+
+
+def video_path_to_data_url(video_path: str) -> str:
+    """Inline a local or ``file://`` video as a base64 data URL."""
+    if video_path.startswith("data:"):
+        return video_path
+
+    resolved = (
+        video_path.removeprefix("file://")
+        if video_path.startswith("file://")
+        else str(Path(video_path).expanduser().resolve())
+    )
+    path = Path(resolved)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Video path resolved to {resolved!r}, which does not exist."
+        )
+
+    ext = path.suffix.lower()
+    mime = _VIDEO_EXT_TO_MIME.get(ext)
+    if mime is None:
+        raise ValueError(
+            f"Unsupported video extension {ext!r} for {resolved!r}. "
+            f"Supported: {sorted(_VIDEO_EXT_TO_MIME)}."
+        )
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:video/{mime};base64,{encoded}"
+
+
+def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
+    """Canonicalize Gym media parts and inline local paths."""
     for example in nemo_gym_examples:
         input_items = example.get("responses_create_params", {}).get("input", [])
         if not isinstance(input_items, list):
@@ -1059,17 +1258,58 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
             if not isinstance(content, list):
                 continue
             for part in content:
-                if not isinstance(part, dict) or part.get("type") != "input_image":
+                if not isinstance(part, dict):
                     continue
-                url = part.get("image_url", "")
-                if isinstance(url, dict):
-                    url = url.get("url", "")
+                part_type = part.get("type")
+                if part_type in ("input_image", "image", "image_url"):
+                    source_keys = ("image_url", "image", "url")
+                    canonical_type = "input_image"
+                    canonical_key = "image_url"
+                    is_image = True
+                elif part_type in ("input_video", "video", "video_url"):
+                    source_keys = ("video_url", "video", "url")
+                    canonical_type = "input_video"
+                    canonical_key = "video_url"
+                    is_image = False
+                else:
+                    continue
+
+                present_keys = [key for key in source_keys if key in part]
+                if not present_keys and part_type == "input_image" and "file_id" in part:
+                    continue
+                if len(present_keys) != 1:
+                    raise ValueError(
+                        f"{part_type} requires exactly one of {source_keys}"
+                    )
+
+                source = part[present_keys[0]]
+                nested_detail = source.get("detail") if isinstance(source, dict) else None
+                url = (
+                    source.get("url") or source.get("path", "")
+                    if isinstance(source, dict)
+                    else source
+                )
                 if not isinstance(url, str) or not url:
-                    continue
-                if url.startswith(("http://", "https://", "data:")):
-                    continue
-                part["image_url"] = image_to_data_url(resolve_to_image(url))
+                    raise ValueError(f"{part_type} requires a non-empty media URL")
+                if not url.startswith(("http://", "https://", "data:")):
+                    url = (
+                        image_to_data_url(resolve_to_image(url))
+                        if is_image
+                        else video_path_to_data_url(url)
+                    )
+
+                for key in source_keys:
+                    if key != canonical_key:
+                        part.pop(key, None)
+                part["type"] = canonical_type
+                part[canonical_key] = url
+                if is_image and nested_detail is not None:
+                    part.setdefault("detail", nested_detail)
     return nemo_gym_examples
+
+
+# Backward-compatible alias for existing callers.
+encode_images_in_examples = normalize_media_in_examples
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:

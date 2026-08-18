@@ -45,22 +45,6 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     # Extract stop_strings if present
     stop_strings = [datum.get("stop_strings", None) for datum in data_batch]
 
-    # check if any of the data batch has vllm content and images
-    extra_args = {}
-    if any(
-        [datum_spec.get("vllm_content", None) is not None for datum_spec in data_batch]
-    ):
-        vllm_content = [
-            datum_spec.get("vllm_content", None) for datum_spec in data_batch
-        ]
-        vllm_images = [datum_spec.get("vllm_images", []) for datum_spec in data_batch]
-        vllm_videos = [datum_spec.get("vllm_videos", []) for datum_spec in data_batch]
-        vllm_audios = [datum_spec.get("vllm_audios", []) for datum_spec in data_batch]
-        extra_args["vllm_content"] = vllm_content
-        extra_args["vllm_images"] = vllm_images
-        extra_args["vllm_videos"] = vllm_videos
-        extra_args["vllm_audios"] = vllm_audios
-
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         length=length,
@@ -70,7 +54,6 @@ def rl_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
         idx=idx,
         batch_max_length=batch_max_length,
         stop_strings=stop_strings,
-        **extra_args,
     )
     return output
 
@@ -119,30 +102,11 @@ def eval_collate_fn(data_batch: list[DatumSpec]) -> BatchedDataDict[Any]:
     idx = [datum_spec["idx"] for datum_spec in data_batch]
     task_names = [datum_spec.get("task_name", None) for datum_spec in data_batch]
 
-    # Check if any of the data batch has vllm content (multimodal data)
-    extra_args = {}
-    if any(
-        datum_spec.get("vllm_content", None) is not None for datum_spec in data_batch
-    ):
-        extra_args["vllm_content"] = [
-            datum_spec.get("vllm_content", None) for datum_spec in data_batch
-        ]
-        extra_args["vllm_images"] = [
-            datum_spec.get("vllm_images", []) for datum_spec in data_batch
-        ]
-        extra_args["vllm_audios"] = [
-            datum_spec.get("vllm_audios", []) for datum_spec in data_batch
-        ]
-        extra_args["vllm_videos"] = [
-            datum_spec.get("vllm_videos", []) for datum_spec in data_batch
-        ]
-
     output: BatchedDataDict[Any] = BatchedDataDict(
         message_log=message_log,
         extra_env_info=extra_env_info,
         idx=idx,
         task_name=task_names,
-        **extra_args,
     )
     return output
 

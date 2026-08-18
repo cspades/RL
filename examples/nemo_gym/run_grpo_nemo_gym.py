@@ -278,6 +278,16 @@ The validation set you pass in will directly be used for validation with no addi
         )
     # Check if async mode is enabled
     elif config.grpo.async_grpo.enabled:
+        generation_backend = config.policy["generation"].get("backend")
+        if (
+            config.policy["generation"]["colocated"]["enabled"]
+            and generation_backend != "megatron"
+        ):
+            raise ValueError(
+                "Colocated async GRPO is only supported for the Megatron "
+                "generation backend. Use backend=megatron, or disable "
+                "policy.generation.colocated.enabled / grpo.async_grpo.enabled."
+            )
         # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
         if config.grpo.use_dynamic_sampling:
             raise NotImplementedError(

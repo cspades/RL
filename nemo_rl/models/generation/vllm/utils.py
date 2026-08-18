@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any, Optional
+from typing import Any, Optional, overload
 
 import torch
 
@@ -22,18 +22,6 @@ from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
     GenerationDatumSpec,
-)
-from nemo_rl.models.generation.vllm.video_utils import (
-    build_cached_video_frame_data_url as build_cached_video_frame_data_url,
-)
-from nemo_rl.models.generation.vllm.video_utils import (
-    load_video_frames as load_video_frames,
-)
-from nemo_rl.models.generation.vllm.video_utils import (
-    load_video_frames_with_metadata as load_video_frames_with_metadata,
-)
-from nemo_rl.models.generation.vllm.video_utils import (
-    register_torchcodec_vllm_video_loader as register_torchcodec_vllm_video_loader,
 )
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
@@ -70,15 +58,27 @@ def _as_routed_experts_tensor(
     return tensor.to(dtype=dtype)
 
 
+@overload
+def format_prompt_for_vllm_generation(
+    data: BatchedDataDict[GenerationDatumSpec], sample_idx: None = None
+) -> list[dict[str, Any]]: ...
+
+
+@overload
+def format_prompt_for_vllm_generation(
+    data: BatchedDataDict[GenerationDatumSpec], sample_idx: int
+) -> dict[str, Any]: ...
+
+
 def format_prompt_for_vllm_generation(
     data: BatchedDataDict[GenerationDatumSpec], sample_idx: Optional[int] = None
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | dict[str, Any]:
     """Format a list of prompts for vllm generation (which requires a specific format for its own `generate` method).
 
     See https://docs.vllm.ai/en/v0.9.1/features/multimodal_inputs.html for prompt format for multimodal inputs.
     """
     # Prepare prompts for vLLM (removing padding)
-    prompts = []
+    prompts: list[dict[str, Any]] = []
 
     input_ids = data["input_ids"]
     batch_size = input_ids.shape[0]
@@ -94,7 +94,7 @@ def format_prompt_for_vllm_generation(
         start_idx = sample_idx
         end_idx = sample_idx + 1
 
-    def _get_regular_prompt(index: int):
+    def _get_regular_prompt(index: int) -> dict[str, Any]:
         valid_length = input_lengths[index].item()
         valid_ids = (
             input_ids[index, :valid_length]
@@ -104,48 +104,38 @@ def format_prompt_for_vllm_generation(
         token_ids = valid_ids.tolist()
         return {"prompt_token_ids": token_ids}
 
-    def _get_multi_modal_data(index: int) -> dict[str, Any]:
-        multi_modal_data = {}
-        images = data.get("vllm_images", None)
-        if images is not None and len(images[index]) > 0:
-            multi_modal_data["image"] = (
-                images[index][0] if len(images[index]) == 1 else images[index]
-            )
-        audios = data.get("vllm_audios", None)
-        if audios is not None and len(audios[index]) > 0:
-            multi_modal_data["audio"] = (
-                audios[index][0] if len(audios[index]) == 1 else audios[index]
-            )
-        videos = data.get("vllm_videos", None)
-        if videos is not None and len(videos[index]) > 0:
-            multi_modal_data["video"] = (
-                videos[index][0] if len(videos[index]) == 1 else videos[index]
-            )
-        return multi_modal_data
-
-    # Native image, audio, and video side channels share this formatter path.
-    if "vllm_content" in data:
-        # VLM generation using content and multi_modal_data
-        for i in range(start_idx, end_idx):
-            msg = data["vllm_content"][i]
-            multi_modal_data = _get_multi_modal_data(i)
-            if not multi_modal_data:
-                prompts.append(_get_regular_prompt(i))
+    def _get_multimodal_data(index: int) -> dict[str, Any]:
+        media: dict[str, list[Any]] = defaultdict(list)
+        message_logs = data.get("message_log")
+        if message_logs is None:
+            return {}
+        for message in message_logs[index]:
+            content = message.get("content")
+            if not isinstance(content, list):
                 continue
-            # Raw processor content is valid only for the initial turn. Later
-            # turns use the updated pre-tokenized conversation plus the same
-            # native media, preventing vLLM from regenerating the stale prompt.
-            prompt_dict = {"prompt": msg} if msg is not None else _get_regular_prompt(i)
-            prompt_dict["multi_modal_data"] = multi_modal_data
-            prompts.append(prompt_dict)
-    else:
-        # Regular LLM generation using token_ids (pre-tokenized).
-        # Note: eval.py uses raw prompt strings instead of token IDs because its
-        # collate function produces message_log dicts, not tokenized tensors.
-        # Both are valid vLLM input formats but may tokenize slightly differently.
-        for i in range(start_idx, end_idx):
-            # Use input_lengths to get only valid tokens (not padding)
-            prompts.append(_get_regular_prompt(i))
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                modality = item.get("type")
+                if modality not in ("image", "audio", "video"):
+                    continue
+                value = item.get(modality)
+                if value is None:
+                    continue
+                if modality == "audio" and "sampling_rate" in item:
+                    value = (value, item["sampling_rate"])
+                media[modality].append(value)
+        return {
+            modality: values[0] if len(values) == 1 else values
+            for modality, values in media.items()
+        }
+
+    for i in range(start_idx, end_idx):
+        prompt = _get_regular_prompt(i)
+        multi_modal_data = _get_multimodal_data(i)
+        if multi_modal_data:
+            prompt["multi_modal_data"] = multi_modal_data
+        prompts.append(prompt)
 
     return prompts if return_all else prompts[0]
 

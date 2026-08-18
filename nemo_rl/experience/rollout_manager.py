@@ -26,6 +26,11 @@ from wandb import Table
 
 from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
+from nemo_rl.data.llm_message_utils import build_generation_input_from_message_logs
+from nemo_rl.data.multimodal_utils import (
+    attach_initial_nemo_gym_image_payload,
+    reattach_static_multimodal_payload,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.failures import (
@@ -44,12 +49,12 @@ from nemo_rl.experience.rollouts import (
     _attach_routed_experts_to_message_log_prefix,
     _dummy_routed_experts_for_tokens,
     _find_routed_experts_template,
+    _reattach_original_multimodal_payloads,
     _tensorize_by_key,
     calculate_rewards,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
-    GenerationDatumSpec,
     GenerationInterface,
 )
 from nemo_rl.utils.timer import Timer
@@ -559,15 +564,12 @@ class AsyncRolloutImpl:
         Returns:
             Tuple of (assistant_message, input_lengths, gen_metrics)
         """
-        # Prepare generation input
-        input_ids = torch.cat([m["token_ids"] for m in message_log]).unsqueeze(0)
-        input_lengths = torch.tensor([input_ids.shape[1]], dtype=torch.int32)
-        generation_input_data = BatchedDataDict[GenerationDatumSpec](
-            {
-                "input_ids": input_ids,
-                "input_lengths": input_lengths,
-                "stop_strings": [stop_strings],
-            }
+        generation_input_data, input_lengths = (
+            build_generation_input_from_message_logs(
+                [message_log],
+                pad_token_id=self._tokenizer.pad_token_id,
+                stop_strings=[stop_strings],
+            )
         )
 
         # Generate response
@@ -710,6 +712,8 @@ class AsyncNemoGymRolloutImpl:
         max_rollout_turns: int,
         generation_config: GenerationConfig,
         mask_env_flagged_samples: bool = True,
+        processor: Any = None,
+        deduplicate_multimodal_data: bool = False,
         # Optional so direct construction does not have to carry the resiliency wiring;
         # RolloutManager always passes both explicitly.
         timeouts: Optional[RolloutTimeouts] = None,
@@ -726,6 +730,8 @@ class AsyncNemoGymRolloutImpl:
         self._max_rollout_turns = max_rollout_turns
         self._generation_config = generation_config
         self._mask_env_flagged_samples = mask_env_flagged_samples
+        self._processor = processor
+        self._deduplicate_multimodal_data = deduplicate_multimodal_data
         self._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
         self._max_gym_row_attempts = (
             retry_policy
@@ -749,6 +755,12 @@ class AsyncNemoGymRolloutImpl:
         timer_prefix = "timing/rollout"
         timer.start(f"{timer_prefix}/total")
 
+        if self._deduplicate_multimodal_data:
+            attach_initial_nemo_gym_image_payload(
+                input_sample["message_log"],
+                input_sample["extra_env_info"],
+                self._processor,
+            )
         rollout_inputs = self._build_inputs(input_sample)
         completions, prompt_message_log, rollout_metrics = await self._run_rollouts(
             rollout_inputs,
@@ -837,7 +849,12 @@ class AsyncNemoGymRolloutImpl:
 
         async for result_ref in nemo_gym_env.run_rollouts.options(
             num_returns="streaming"
-        ).remote(pending, self._tokenizer, timer_prefix):
+        ).remote(
+            pending,
+            self._tokenizer,
+            timer_prefix,
+            self._deduplicate_multimodal_data,
+        ):
             rowidx, result, timing_metrics = await result_ref
             # Validated against the original group, not the pending subset: on a
             # re-dispatch the row keeps its original index so results stay ordered.
@@ -957,10 +974,6 @@ class AsyncNemoGymRolloutImpl:
             # All N rollouts share the same input prompt; tensorize one copy.
             prompt_message_log = completed_results[0]["input_message_log"]
             _tensorize_by_key(prompt_message_log, "token_ids")
-            from nemo_rl.environments.nemo_gym_video import (
-                reattach_static_multimodal_payload,
-            )
-
             reattach_static_multimodal_payload(prompt_message_log, source_message_log)
             # Convert results to completions.
             completions = [
@@ -993,11 +1006,10 @@ class AsyncNemoGymRolloutImpl:
             [m for m in result["message_log"] if m["role"] == "assistant"],
             "generation_logprobs",
         )
-        from nemo_rl.environments.nemo_gym_video import (
-            reattach_static_multimodal_payload,
-        )
-
-        reattach_static_multimodal_payload(result["message_log"], source_message_log)
+        initial_media_omitted = bool(result.get("_initial_multimodal_data_omitted"))
+        _reattach_original_multimodal_payloads([result], [source_message_log])
+        if not initial_media_omitted:
+            reattach_static_multimodal_payload(result["message_log"], source_message_log)
 
         # Calculate truncation.
         truncated = (
@@ -1110,6 +1122,8 @@ class RolloutManager:
         generation_config: Optional[GenerationConfig] = None,
         use_nemo_gym: bool = False,
         mask_env_flagged_samples: bool = True,
+        processor: Any = None,
+        deduplicate_multimodal_data: bool = False,
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
@@ -1148,6 +1162,8 @@ class RolloutManager:
             generation_config=generation_config,
             # Only used by AsyncNemoGymRolloutImpl; AsyncRolloutImpl ignores it.
             mask_env_flagged_samples=mask_env_flagged_samples,
+            processor=processor,
+            deduplicate_multimodal_data=deduplicate_multimodal_data,
             # None means "no deadlines", which is what async_rl's own defaults resolve
             # to; callers that have a config pass the resolved values in.
             timeouts=timeouts if timeouts is not None else RolloutTimeouts(),

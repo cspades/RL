@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import numpy as np
 import torch
@@ -23,14 +23,20 @@ from nemo_rl.data.interfaces import (
     FlatMessagesType,
     LLMMessageLogType,
     TaskDataSpec,
+    VLMMessageLogType,
 )
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
+    build_media_cache_key,
     extract_multimodal_model_inputs,
+    get_dim_to_pack_along,
     get_multimodal_default_settings_from_processor,
     load_media_from_message,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+if TYPE_CHECKING:
+    from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 
 Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
@@ -57,7 +63,7 @@ def _validated_packed_values(key: str, values: list[Any]) -> list[PackedTensor]:
 
 
 def message_log_to_flat_messages(
-    message_log: LLMMessageLogType,
+    message_log: LLMMessageLogType | VLMMessageLogType,
 ) -> FlatMessagesType:
     """Converts a message log (sequence of message turns) into a flattened representation.
 
@@ -255,7 +261,7 @@ def _validate_tensor_consistency(tensors: list[Tensor]) -> None:
 
 
 def batched_message_log_to_flat_message(
-    message_log_batch: list[LLMMessageLogType],
+    message_log_batch: list[LLMMessageLogType | VLMMessageLogType],
     pad_value_dict: Optional[dict[str, int]] = None,
     make_sequence_length_divisible_by: int = 1,
 ) -> tuple[BatchedDataDict[FlatMessagesType], Tensor]:
@@ -428,6 +434,58 @@ def batched_message_log_to_flat_message(
         result[key] = torch.stack(padded)
 
     return result, input_lengths_tensor
+
+
+def get_media_cache_keys_from_message_logs(
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+) -> list[Optional[str]]:
+    """Return one stable composed media-cache identity per message log."""
+    media_cache_keys: list[Optional[str]] = []
+    for message_log in message_logs:
+        keys = [
+            message["media_cache_key"]
+            for message in message_log
+            if isinstance(message.get("media_cache_key"), str)
+        ]
+        if len(keys) == 1:
+            media_cache_keys.append(keys[0])
+        elif keys:
+            media_cache_keys.append(
+                build_media_cache_key(
+                    [("media_cache_key", key) for key in keys],
+                    settings={"composition": "ordered-message-log"},
+                )
+            )
+        else:
+            media_cache_keys.append(None)
+    return media_cache_keys
+
+
+def build_generation_input_from_message_logs(
+    message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    *,
+    pad_token_id: int,
+    stop_strings: Optional[list[Optional[list[str]]]] = None,
+) -> tuple[BatchedDataDict["GenerationDatumSpec"], Tensor]:
+    """Build backend-neutral generation inputs from live message logs."""
+    flat_messages, input_lengths = batched_message_log_to_flat_message(
+        message_logs,
+        pad_value_dict={"token_ids": pad_token_id},
+    )
+    generation_input = BatchedDataDict(
+        {
+            "input_ids": flat_messages["token_ids"],
+            "input_lengths": input_lengths,
+            "message_log": message_logs,
+        }
+    )
+    media_cache_keys = get_media_cache_keys_from_message_logs(message_logs)
+    if any(key is not None for key in media_cache_keys):
+        generation_input["media_cache_key"] = media_cache_keys
+    if stop_strings is not None:
+        generation_input["stop_strings"] = stop_strings
+    generation_input.update(flat_messages.get_multimodal_dict(as_tensors=False))
+    return cast(BatchedDataDict["GenerationDatumSpec"], generation_input), input_lengths
 
 
 def message_log_shape(message_log: LLMMessageLogType) -> list[dict[str, torch.Size]]:

@@ -460,6 +460,7 @@ def vlm_hf_data_processor(
     from nemo_rl.data.datasets.response_datasets.refcoco import format_refcoco_dataset
     from nemo_rl.data.multimodal_utils import (
         PackedTensor,
+        build_media_cache_key,
         get_dim_to_pack_along,
         get_multimodal_default_settings_from_processor,
         get_multimodal_keys_from_processor,
@@ -504,8 +505,7 @@ def vlm_hf_data_processor(
     user_message: dict[str, Any] = {"role": "user", "content": []}
     #
     images = []
-    audios = []
-    videos = []
+    media_sources: list[tuple[str, Any]] = []
     load_video_kwargs: dict[str, Any] = {}
     if isinstance(problem, list):
         for content in problem:
@@ -521,17 +521,19 @@ def vlm_hf_data_processor(
                     }
                 )
             elif content["type"] == "image":
-                user_message["content"].append(content)
-                images.append(content["image"])
+                media_sources.append(("image", content["image"]))
+                image = resolve_to_image(content["image"])
+                user_message["content"].append({**content, "image": image})
+                images.append(image)
             elif content["type"] == "audio":
-                user_message["content"].append(content)
-                # Store as (audio_array, sample_rate) tuple for vLLM
-                audios.append(
-                    (content["audio"], processor.feature_extractor.sampling_rate)
+                sampling_rate = processor.feature_extractor.sampling_rate
+                user_message["content"].append(
+                    {**content, "sampling_rate": sampling_rate}
                 )
             elif content["type"] == "video":
                 from transformers.video_utils import load_video
 
+                media_sources.append(("video", content["video"]))
                 if not load_video_kwargs:
                     load_video_kwargs = get_multimodal_default_settings_from_processor(
                         processor
@@ -543,14 +545,19 @@ def vlm_hf_data_processor(
                     )[0]
                 # Replace path with loaded frames so apply_chat_template can consume it
                 user_message["content"].append({"type": "video", "video": video_value})
-                videos.append(video_value)
             else:
                 raise ValueError(f"Unsupported content type: {content['type']}")
     else:
         # conversation consists of a text-only message
         user_message["content"] = task_data_spec.prompt.format(problem)
 
-    images = [resolve_to_image(image) for image in images]
+    media_cache_key = build_media_cache_key(
+        media_sources,
+        settings={"processor": type(processor).__name__},
+    )
+    if media_cache_key is not None:
+        user_message["media_cache_key"] = media_cache_key
+
     # Detect processors that use <image> placeholder style (e.g., NemotronOmni/InternVL)
     # vs OpenAI content list style (e.g., Qwen-VL, Gemma).
     # These processors expand <image> tokens in __call__ but NOT in apply_chat_template,
@@ -657,31 +664,22 @@ def vlm_hf_data_processor(
     length = sum(len(m["token_ids"]) for m in message_log)
     loss_multiplier = 1.0
     if length >= max_seq_length:
-        # Treat truncated messages as text only
-        vllm_kwargs = {
-            "vllm_content": None,
-            "vllm_images": [],
-            "vllm_audios": [],
-            "vllm_videos": [],
-        }
-
         # make smaller and mask out
         for chat_message in message_log:
             chat_message["token_ids"] = chat_message["token_ids"][
                 : min(4, max_seq_length // len(message_log))
             ]
+            content = chat_message.get("content")
+            if isinstance(content, list):
+                chat_message["content"] = [
+                    item
+                    for item in content
+                    if not isinstance(item, dict) or item.get("type") == "text"
+                ]
             for key, value in chat_message.items():
                 if isinstance(value, PackedTensor):
                     chat_message[key] = PackedTensor.empty_like(value)
         loss_multiplier = 0.0
-    else:
-        # get the prompt content! (use this for vllm-backend that needs formatted dialog and list of images/audios) for the entire conversation
-        vllm_kwargs = {
-            "vllm_content": string_formatted_dialog,
-            "vllm_images": images,
-            "vllm_audios": audios,
-            "vllm_videos": videos,
-        }
 
     output: DatumSpec = {
         "message_log": message_log,
@@ -690,7 +688,6 @@ def vlm_hf_data_processor(
         "loss_multiplier": loss_multiplier,
         "idx": idx,
         "task_name": datum_dict["task_name"],
-        **vllm_kwargs,  # pyrefly: ignore[bad-unpacking]
     }
     return output
 

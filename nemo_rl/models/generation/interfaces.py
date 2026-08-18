@@ -283,7 +283,9 @@ class GenerationDatumSpec(TypedDict):
 
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
-    stop_strings: NotRequired[list[str]]
+    stop_strings: NotRequired[list[Optional[list[str]]]]
+    message_log: NotRequired[list[list[dict[str, Any]]]]
+    media_cache_key: NotRequired[list[Optional[str]]]
     __extra__: Any
 
 

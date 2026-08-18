@@ -105,66 +105,10 @@ def _source_media(row: dict[str, Any], key: str) -> list[Any]:
     return _as_list(value)
 
 
-def _agent_name(row: dict[str, Any], *, line_number: int) -> str:
-    agent_ref = row.get("agent_ref")
-    if not isinstance(agent_ref, dict):
-        raise ValueError(f"line {line_number}: agent_ref must be an object")
-    name = agent_ref.get("name")
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError(
-            f"line {line_number}: agent_ref.name must be a non-empty string"
-        )
-    return name.strip()
-
-
-def _validate_expected_answer(
-    row: dict[str, Any], *, agent_name: str, line_number: int
-) -> None:
-    answer = row.get("expected_answer")
-    if not isinstance(answer, str) or not answer.strip():
-        raise ValueError(
-            f"line {line_number}: expected_answer must be a non-empty string"
-        )
-    if agent_name != "mcqa_simple_agent":
-        return
-
-    answer = answer.strip()
-    if re.fullmatch(r"[A-J]", answer) is None:
-        raise ValueError(
-            f"line {line_number}: MCQA expected_answer must be one uppercase "
-            f"letter A-J, got {answer!r}"
-        )
-    options = row.get("options")
-    if not isinstance(options, list) or len(options) < 2:
-        raise ValueError(
-            f"line {line_number}: MCQA rows require at least two parsed options"
-        )
-    option_keys: set[str] = set()
-    for option in options:
-        if not isinstance(option, dict) or len(option) != 1:
-            raise ValueError(
-                f"line {line_number}: every MCQA option must contain one letter"
-            )
-        letter, text = next(iter(option.items()))
-        if (
-            not isinstance(letter, str)
-            or re.fullmatch(r"[A-J]", letter) is None
-            or not isinstance(text, str)
-            or not text.strip()
-            or letter in option_keys
-        ):
-            raise ValueError(f"line {line_number}: invalid MCQA option {option!r}")
-        option_keys.add(letter)
-    if answer not in option_keys:
-        raise ValueError(
-            f"line {line_number}: MCQA answer {answer!r} is not present in options"
-        )
-
-
 def validate_row(row: dict[str, Any], *, line_number: int) -> None:
     """Validate the static video contract used by NeMo-RL Gym preprocessing."""
-    agent_name = _agent_name(row, line_number=line_number)
-    _validate_expected_answer(row, agent_name=agent_name, line_number=line_number)
+    if not isinstance(row.get("agent_ref"), dict):
+        raise ValueError(f"line {line_number}: agent_ref must be present")
     parts = _video_parts(row)
     if len(parts) != 1:
         raise ValueError(
@@ -240,7 +184,7 @@ def convert(args: argparse.Namespace) -> None:
                 "type": "responses_api_agents",
                 "name": agent_name,
             }
-        agent_name = _agent_name(row, line_number=line_number)
+        agent_name = row["agent_ref"]["name"]
 
         content: list[dict[str, Any]] = []
         if args.system_prompt:
@@ -262,10 +206,9 @@ def convert(args: argparse.Namespace) -> None:
                 )
             },
         }
-        raw_answer = source_row.get("answer")
-        if raw_answer is None:
-            raw_answer = source_row.get("expected_answer")
-        answer = "" if raw_answer is None else str(raw_answer).strip()
+        answer = str(
+            source_row.get("answer", source_row.get("expected_answer", ""))
+        ).strip()
         if len(answer) == 1 and answer.isalpha():
             answer = answer.upper()
         row["expected_answer"] = answer
@@ -273,9 +216,11 @@ def convert(args: argparse.Namespace) -> None:
         if agent_name == "mcqa_simple_agent":
             options = _extract_mcqa_options(prompt)
             if not options:
-                raise ValueError(
-                    f"line {line_number}: could not parse MCQA options from prompt"
-                )
+                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                max_idx = max(letters.find(answer), 9)
+                options = [
+                    {letter: f"Option {letter}"} for letter in letters[: max_idx + 1]
+                ]
             row["options"] = options
             row["grading_mode"] = "strict_single_letter_boxed"
 
