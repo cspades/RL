@@ -14,29 +14,28 @@
 
 import asyncio
 import gc
-import os
 import threading
 import time
 import warnings
-from typing import AsyncGenerator, Optional
+from dataclasses import replace
+from typing import Any, AsyncGenerator, Optional
 
 import requests
 import torch
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     KVCacheManagementMode,
     PrefixCachingCoordinatorPolicy,
+    VideoProcessingConfig,
 )
-from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
-from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.refit import (
     prepare_swap_model_weights,
     swap_model_weights,
 )
-from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.utils import toggle_cuda_graphs
 from megatron.core.utils import unwrap_model
 
@@ -47,8 +46,12 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.generation.megatron.utils import (
+    build_image_preprocessing_config,
     log_gpu_memory,
     resolve_torch_dtype,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    _CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
 )
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
@@ -59,68 +62,131 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 class MegatronGenerationMixin:
-    """Engine lifecycle, coordinator, HTTP server, and finish-generation machinery.
+    """Megatron inference lifecycle and generation helpers."""
 
-    The host class must provide:
-
-     - model: the megatron module.
-     - cfg: policy config (TypedDict).
-     - rank: global rank (used for logging).
-     - tokenizer: HF tokenizer.
-     - megatron_tokenizer: tokenizer for inference.
-     - is_generation_colocated: Whether colocated or distributed.
-    """
-
-    # Colocated-reshard hosts assign the dedicated inference-layout model here
-    # (see MegatronPolicyWorkerImpl._build_colocated_inference_model).
     inference_model = None
     _colocated_reshard_plan = None
 
     def _gen_model(self) -> MegatronModule:
-        """The model the inference engine wraps.
-
-        Returns the dedicated inference-layout model when one exists (colocated
-        reshard), otherwise the shared training model.
-        """
+        """Return the dedicated inference model when colocated reshard uses one."""
         return self.inference_model if self.inference_model is not None else self.model
 
     def _init_inference_engine_state(self) -> None:
         """Reset all inference-engine attributes to their uninitialized state."""
-        self.dynamic_inference_engine = None
-        self.inference_client = None
-        self.inference_context = None
-        self.inference_wrapped_model = None
+        self.llm = None
         self.base_url = None
         self._inference_engine_initialized = False
-        self._inference_engine_asleep = (
-            True  # Start paused since we begin with training
+        self._inference_engine_asleep = True
+        self._inference_lifecycle_lock = threading.Lock()
+
+    def _inference_model_and_media_parts(self):
+        """Return the language model used by MCore and its optional media model."""
+        from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
+            NemotronOmniModel,
         )
-        self._inference_loop = None
-        self._inference_thread = None
+        from megatron.bridge.models.nemotron_vl.modeling_nemotron_vl import (
+            NemotronVLModel,
+        )
+        from megatron.core.models.multimodal.llava_model import LLaVAModel
+
+        model = unwrap_model(self._gen_model())
+        if isinstance(model, (list, tuple)):
+            if len(model) != 1:
+                raise NotImplementedError("Virtual pipeline models are not supported.")
+            model = model[0]
+
+        if isinstance(model, NemotronVLModel):
+            media_model = model.llava_model
+            if media_model is None:
+                return model, None
+            return media_model.language_model, media_model
+        if isinstance(model, (NemotronOmniModel, LLaVAModel)):
+            return model.language_model, model
+        return model, None
+
+    @staticmethod
+    def _get_vlm_inference_wrapper_cls(media_model):
+        """Select the inference adapter for a model's multimodal contract."""
+        from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import (
+            NemotronOmniModel,
+        )
+        from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
+            NemotronOmniInferenceWrapper,
+        )
+        from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
+            VLMInferenceWrapper,
+        )
+
+        if isinstance(media_model, NemotronOmniModel):
+            return NemotronOmniInferenceWrapper
+        return VLMInferenceWrapper
+
+    @staticmethod
+    def _load_hf_image_processor(model_name: str):
+        """Load the model's HF image processor, whichever auto class it registers."""
+        from transformers import AutoImageProcessor, AutoProcessor
+
+        try:
+            return AutoImageProcessor.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+        except Exception:
+            processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+            return processor.image_processor
+
+    def _build_image_preprocessing_config(self, media_model):
+        """Build raw-image preprocessing settings."""
+        if media_model is None:
+            return None
+
+        model_name = self.cfg["model_name"]
+        try:
+            processor = getattr(self, "processor", None)
+            if processor is None:
+                processor = self._load_hf_image_processor(model_name)
+            else:
+                processor = getattr(processor, "image_processor", processor)
+            image_preprocessing_config = build_image_preprocessing_config(
+                processor,
+                dynamic_resolution=bool(
+                    getattr(media_model, "dynamic_resolution", True)
+                ),
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Could not derive image preprocessing settings for {model_name}: "
+                f"{exc}. Requests that carry raw images (base64 image_url over the "
+                "HTTP server) will be rejected by the engine.",
+                stacklevel=2,
+            )
+            return None
+
+        model_patch_dim = getattr(media_model, "patch_dim", None)
+        if (
+            model_patch_dim is not None
+            and int(model_patch_dim) != image_preprocessing_config.patch_dim
+        ):
+            raise ValueError(
+                f"{model_name}'s image processor patches at "
+                f"{image_preprocessing_config.patch_dim}px but the model expects "
+                f"{int(model_patch_dim)}px."
+            )
+        return image_preprocessing_config
 
     def _initialize_inference_engine(self, mcore_generation_config: dict) -> None:
         """Initialize the persistent inference engine and client."""
-        # TODO: Switch to standardized Megatron API.
         if self._inference_engine_initialized:
             return
 
+        from megatron.core.inference.apis import MegatronAsyncLLM
         from megatron.core.inference.config import MambaInferenceStateConfig
-        from megatron.core.inference.contexts.dynamic_context import (
-            DynamicInferenceContext,
-        )
-        from megatron.core.inference.engines.dynamic_engine import (
-            DynamicInferenceEngine,
-        )
-        from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-            GPTInferenceWrapper,
-        )
-        from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-            TextGenerationController,
-        )
         from megatron.core.utils import get_attr_wrapped_model
 
-        gen_model = self._gen_model()
-        pg_collection = get_attr_wrapped_model(gen_model, "pg_collection")
+        inference_model, media_model = self._inference_model_and_media_parts()
+        pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
+        model_config = inference_model.config
 
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
@@ -141,7 +207,10 @@ class MegatronGenerationMixin:
         num_speculative_tokens = mcore_generation_config["num_speculative_tokens"]
         max_requests = mcore_generation_config.get("max_requests")
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(gen_model)
+        # Omni / hybrid: Mamba state lives on the nested language HybridModel.
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+            inference_model
+        )
         is_hybrid_model = mamba_inference_state_config is not None
         if is_hybrid_model:
             if (
@@ -166,10 +235,49 @@ class MegatronGenerationMixin:
             logging_step_interval = 0
 
         # flashinfer's fused-RoPE kernel only dispatches fp16/bf16 q/k.
-        use_flashinfer_fused_rope = gen_model.config.params_dtype in (
+        use_flashinfer_fused_rope = model_config.params_dtype in (
             torch.float16,
             torch.bfloat16,
         )
+
+        image_preprocessing_config = self._build_image_preprocessing_config(media_model)
+        video_preprocessing_config = None
+        if image_preprocessing_config is not None and hasattr(media_model, "patch_dim"):
+            video_image_preprocessing_config = image_preprocessing_config
+            if "video_target_num_patches" in mcore_generation_config:
+                video_image_preprocessing_config = replace(
+                    image_preprocessing_config,
+                    dynamic_resolution_max_patches=int(
+                        mcore_generation_config["video_target_num_patches"]
+                    ),
+                )
+            model_temporal_patch_size = int(
+                getattr(
+                    getattr(media_model, "vision_model", None),
+                    "temporal_patch_dim",
+                    1,
+                )
+            )
+            configured_temporal_patch_size = int(
+                mcore_generation_config.get(
+                    "video_temporal_patch_size", model_temporal_patch_size
+                )
+            )
+            if configured_temporal_patch_size != model_temporal_patch_size:
+                raise ValueError(
+                    "mcore_generation_config.video_temporal_patch_size must "
+                    "match the loaded vision model: "
+                    f"{configured_temporal_patch_size} != "
+                    f"{model_temporal_patch_size}."
+                )
+            video_preprocessing_config = VideoProcessingConfig(
+                image_config=video_image_preprocessing_config,
+                num_frames=int(
+                    mcore_generation_config.get("video_num_frames", 8)
+                ),
+                temporal_patch_size=configured_temporal_patch_size,
+                frame_manifest_magic=_CACHED_VIDEO_FRAME_MANIFEST_MAGIC,
+            )
 
         inference_config = InferenceConfig(
             block_size_tokens=block_size_tokens,
@@ -182,10 +290,16 @@ class MegatronGenerationMixin:
             use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             use_flashinfer_fused_rope=use_flashinfer_fused_rope,
             sampling_backend="flashinfer",
+            async_sched_mode=AsyncScheduleMode(
+                mcore_generation_config.get("async_sched_mode", "legacy")
+            ),
             use_synchronous_zmq_collectives=True,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_prefix_caching=mcore_generation_config["enable_prefix_caching"],
+            vision_embedding_cache_max_bytes=int(
+                mcore_generation_config.get("vision_embedding_cache_max_bytes", 0)
+            ),
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
                 "first_prefix_block"
             ),
@@ -197,115 +311,70 @@ class MegatronGenerationMixin:
             ),
             logging_step_interval=logging_step_interval,
             num_speculative_tokens=num_speculative_tokens,
-            logprobs_mode="processed_logprobs",
+            logprobs_mode=mcore_generation_config.get(
+                "logprobs_mode", "raw_logprobs"
+            ),
             max_requests=max_requests,
+            image_preprocessing_config=image_preprocessing_config,
+            video_preprocessing_config=video_preprocessing_config,
         )
 
         if "inference_cuda_graph_scope" in mcore_generation_config:
-            gen_model.config.inference_cuda_graph_scope = InferenceCudaGraphScope[
+            model_config.inference_cuda_graph_scope = InferenceCudaGraphScope[
                 mcore_generation_config["inference_cuda_graph_scope"]
             ]
 
-        self.inference_context = DynamicInferenceContext(
-            gen_model.config, inference_config
-        )
-        self.inference_wrapped_model = GPTInferenceWrapper(
-            gen_model, self.inference_context
-        )
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=self.inference_wrapped_model,
+        # Identify the Megatron multimodal inference wrapper class for this model.
+        if media_model is None:
+            llm_model = self._gen_model()
+            inference_wrapper_cls = None
+        else:
+            llm_model = media_model
+            inference_wrapper_cls = self._get_vlm_inference_wrapper_cls(media_model)
+
+        self.llm = MegatronAsyncLLM(
+            model=llm_model,
             tokenizer=self.megatron_tokenizer,
-        )
-        self.dynamic_inference_engine = DynamicInferenceEngine(
-            text_generation_controller, self.inference_context
+            inference_config=inference_config,
+            use_coordinator=True,
+            inference_wrapper_cls=inference_wrapper_cls,
         )
 
         self._inference_engine_initialized = True
-        self._inference_engine_asleep = True
-        print(f"[Rank {self.rank}] Initialized persistent inference engine")
-
-    async def _start_inference_coordinator(self):
-        """Start the inference coordinator and engine loop."""
-        self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=None,
-            launch_inference_coordinator=True,
-        )
-        if torch.distributed.get_rank() == 0:
-            from megatron.core.inference.inference_client import InferenceClient
-
-            self.inference_client = InferenceClient(
-                inference_coordinator_address=self.coordinator_addr, deserialize=True
-            )
-            result = self.inference_client.start()
-            if result is not None:
-                await result
-
         self._inference_engine_asleep = False
+        print(f"[Rank {self.rank}] Initialized persistent inference engine")
 
     def _sleep(self) -> None:
         """Pause + suspend the engine. No-op if already asleep."""
-        if self._inference_engine_asleep:
-            return
-        future = asyncio.run_coroutine_threadsafe(
-            self._sleep_engine(), self._inference_loop
-        )
-        future.result()
-        torch.distributed.barrier()
-        self._inference_engine_asleep = True
-        print(f"[Rank {self.rank}] paused inference engine")
+        with self._inference_lifecycle_lock:
+            if self._inference_engine_asleep:
+                return
+            self.llm.run_sync(self._sleep_engine())
+            self._inference_engine_asleep = True
+            print(f"[Rank {self.rank}] paused inference engine")
 
-    async def _sleep_engine(self):
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.pause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
-
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.suspend_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.SUSPENDED)
+    async def _sleep_engine(self) -> None:
+        await self.llm.pause()
+        await self.llm.suspend()
 
     def _wake(self) -> None:
         """Resume + unpause the engine. No-op if already awake."""
-        if not self._inference_engine_asleep:
-            return
-        future = asyncio.run_coroutine_threadsafe(
-            self._wake_engine(), self._inference_loop
-        )
-        future.result()
-        torch.distributed.barrier()
-        self._inference_engine_asleep = False
-        print(f"[Rank {self.rank}] resumed inference engine")
+        with self._inference_lifecycle_lock:
+            if not self._inference_engine_asleep:
+                return
+            self.llm.run_sync(self._wake_engine())
+            self._inference_engine_asleep = False
+            print(f"[Rank {self.rank}] resumed inference engine")
 
-    async def _wake_engine(self):
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.resume_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RESUMED)
-
-        if torch.distributed.get_rank() == 0:
-            self.inference_client.unpause_engines()
-        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
-
-    def _start_inference_loop_thread(self):
-        """Start a background thread with a persistent event loop for inference."""
-        # CUDA current_device is per-thread.
-        # The worker's __init__ thread called set_device(LOCAL_RANK), and this thread must match.
-        local_rank = int(os.environ["LOCAL_RANK"])
-
-        def run_loop():
-            torch.cuda.set_device(local_rank)
-            asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
-            self._inference_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._inference_loop)
-            self._inference_loop.run_forever()
-
-        self._inference_thread = threading.Thread(target=run_loop, daemon=True)
-        self._inference_thread.start()
-        while self._inference_loop is None:
-            time.sleep(0.001)
+    async def _wake_engine(self) -> None:
+        await self.llm.resume()
+        await self.llm.unpause()
 
     def _setup_openai_api_server(self) -> str:
         """Start the OpenAI-compatible HTTP server on this worker."""
-        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (
-            start_text_gen_server,
+        from megatron.core.inference.apis import (
+            MultimodalPromptConfig,
+            ServeConfig,
         )
 
         from nemo_rl.distributed.virtual_cluster import (
@@ -315,15 +384,21 @@ class MegatronGenerationMixin:
 
         ip = _get_node_ip_local()
         free_port = _get_free_port_local()
+        prompt_config = self.cfg["generation"]["mcore_generation_config"].get(
+            "multimodal_prompt_config"
+        )
 
-        start_text_gen_server(
-            coordinator_addr=self.coordinator_addr,
-            tokenizer=self.megatron_tokenizer,
-            rank=torch.distributed.get_rank(),
-            server_port=free_port,
+        serve_config = ServeConfig(
+            port=free_port,
             parsers=self.cfg["generation"]["mcore_generation_config"]["parsers"],
             verbose=False,
+            multimodal_prompt_config=(
+                MultimodalPromptConfig.from_dict(prompt_config)
+                if prompt_config
+                else None
+            ),
         )
+        self.llm.run_sync(self.llm.serve(serve_config, blocking=False))
 
         base_url = f"http://{ip}:{free_port}/v1"
         max_wait_time = 300
@@ -344,28 +419,17 @@ class MegatronGenerationMixin:
                 time.sleep(2)
         return base_url
 
-    def _run_async_coordinator_start(self):
-        """Start the coordinator and engine loop in the background thread."""
-        if self._inference_loop is None:
-            self._start_inference_loop_thread()
-
-        future = asyncio.run_coroutine_threadsafe(
-            self._start_inference_coordinator(), self._inference_loop
-        )
-        # _start_inference_coordinator awaits RUNNING, so future.result() only returns once
-        # this rank's engine is fully warmed up. Cross-rank sync is handled by Ray's actor
-        # group semantics (the caller waits for all workers' prepare_for_generation).
-        future.result()
-        print(f"[Rank {torch.distributed.get_rank()}] Coordinator started")
-
+    def _maybe_start_openai_api_server(self) -> None:
+        """Start the OpenAI HTTP server on rank 0 when configured to expose it."""
+        rank = torch.distributed.get_rank()
         if (
             self.cfg["generation"]["mcore_generation_config"]["expose_http_server"]
-            and torch.distributed.get_rank() == 0
+            and rank == 0
         ):
-            print(f"[Rank {torch.distributed.get_rank()}] Starting HTTP Server")
+            print(f"[Rank {rank}] Starting HTTP Server")
             self.base_url = self._setup_openai_api_server()
         else:
-            print(f"[Rank {torch.distributed.get_rank()}] HTTP Server not started")
+            print(f"[Rank {rank}] HTTP Server not started")
             self.base_url = None
 
     def finish_generation(self, *, release_gpu: bool = True) -> None:
@@ -386,7 +450,8 @@ class MegatronGenerationMixin:
         print(f"[Rank {self.rank}] finishing generation", flush=True)
         log_gpu_memory("finish_generation START")
 
-        lang_module = unwrap_model(self._gen_model())
+        inference_model, _ = self._inference_model_and_media_parts()
+        lang_module = unwrap_model(inference_model)
 
         if self.is_generation_colocated:
             if self._inference_engine_initialized and not self._inference_engine_asleep:
@@ -404,7 +469,6 @@ class MegatronGenerationMixin:
             rotary_module.forward.cache_clear()
 
         if self.is_generation_colocated:
-            # Offload the inference weights to CPU.
             if self.inference_model is not None:
                 self._offload_inference_model()
             gc.collect()
@@ -436,33 +500,23 @@ class MegatronGenerationMixin:
         log_gpu_memory("prepare_for_generation START")
         mcore_generation_config = self.cfg["generation"]["mcore_generation_config"]
 
-        # Colocated reshard: build the dedicated inference-layout model on the first cycle.
         if self._colocated_reshard_plan is not None:
             self._build_colocated_inference_model(self.cfg)
 
-        gen_model = self._gen_model()
-        # `flash_decode` selects Megatron Inference's deprecated static-batching decode path,
-        # which would cause an assertion error if taken.
-        gen_model.config.flash_decode = False
         if self.is_generation_colocated and self.inference_model is None:
             self.model = self.move_model(
                 self.model, "cuda", move_params=True, move_grads=False
             )
-            # Because DP inference requests are asynchronously scheduled per rank, pre-forward hooks that trigger DP collectives (such as an overlapped param gather after optimizer steps) will stall or hang.
-            # Instead, synchronously gather all model compute weights from the sharded model state here, and deactivate all pre-forward hooks.
-            # Incompatible with FSDP2 or Megatron-FSDP for inference.
-            if (
-                self.should_disable_forward_pre_hook
-                and self._forward_pre_hook_enabled()
-            ):
+            # Gather parameters collectively before DP inference.
+            if self._forward_pre_hook_enabled():
                 self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
-            gen_model = self.model
 
-        # Colocated reshard (hosts without a dedicated inference model skip it).
         if self.inference_model is not None:
             self._reshard_into_inference_model()
 
-        lang_module = unwrap_model(gen_model)
+        inference_model, _ = self._inference_model_and_media_parts()
+        inference_model.config.flash_decode = False
+        lang_module = unwrap_model(inference_model)
         lang_module.eval()
 
         rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -475,15 +529,11 @@ class MegatronGenerationMixin:
         if cuda_graph_impl != "none":
             toggle_cuda_graphs(lang_module, set_to=cuda_graph_impl)
 
-        # tags=["weights"] means we are inside refit_policy_generation between
-        # suspend_for_refit and the weight transfer — the engine was intentionally
-        # paused and waking it now would race NVSHMEM init / weight transfer against
-        # CUDA-graph replay, corrupting TE FP8 state. The subsequent
-        # prepare_for_generation(tags=["kv_cache"]) is what actually wakes it.
+        # Keep the engine paused during weight transfer.
         if tags is None or "weights" not in tags:
             if not self._inference_engine_initialized:
                 self._initialize_inference_engine(mcore_generation_config)
-                self._run_async_coordinator_start()
+                self._maybe_start_openai_api_server()
             else:
                 self._wake()
 
@@ -494,7 +544,11 @@ class MegatronGenerationMixin:
         return self.base_url
 
     def _build_sampling_params(
-        self, greedy: bool, stop_words: Optional[list[str]]
+        self,
+        greedy: bool,
+        stop_words: Optional[list[str]],
+        *,
+        return_prompt_tokens: bool = False,
     ) -> SamplingParams:
         """Build mcore SamplingParams for a single request."""
         top_k_cfg = self.cfg["generation"]["top_k"]
@@ -514,6 +568,7 @@ class MegatronGenerationMixin:
             num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
             termination_id=self.megatron_tokenizer.eod,
             stop_words=stop_words,
+            return_prompt_tokens=return_prompt_tokens,
         )
 
     def _merge_stop_strings(
@@ -529,10 +584,162 @@ class MegatronGenerationMixin:
                     stop_set.update(sample_ss)
         return list(stop_set) if stop_set else None
 
+    def _collapse_image_spans(self, prompt_tokens: list[int]) -> list[int]:
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        img_start = tokenizer.convert_tokens_to_ids("<img>")
+        img_end = tokenizer.convert_tokens_to_ids("</img>")
+        image_token = tokenizer.convert_tokens_to_ids("<image>")
+
+        collapsed = []
+        offset = 0
+        while offset < len(prompt_tokens):
+            if prompt_tokens[offset] != img_start:
+                collapsed.append(prompt_tokens[offset])
+                offset += 1
+                continue
+            try:
+                end = prompt_tokens.index(img_end, offset + 1)
+            except ValueError as exc:
+                raise ValueError("Unterminated <img> span in image prompt.") from exc
+            collapsed.extend((img_start, image_token, img_end))
+            offset = end + 1
+        return collapsed
+
+    def _build_prompt_and_multimodal_data(self, data, index: int):
+        length = int(data["input_lengths"][index].item())
+        expanded_prompt = data["input_ids"][index, :length].tolist()
+        imgs, imgs_sizes, num_frames = self._sample_vision_tensors(data, index)
+        media_cache_keys = data.get("media_cache_key")
+        media_cache_key = (
+            media_cache_keys[index] if media_cache_keys is not None else None
+        )
+        if media_cache_key is not None and not isinstance(media_cache_key, str):
+            raise TypeError("media_cache_key entries must be strings or None.")
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        if imgs is None:
+            if tokenizer.convert_tokens_to_ids("<img>") in expanded_prompt:
+                raise ValueError(
+                    "Megatron image generation requires per-sample pixel_values and "
+                    "imgs_sizes from RL preprocessing, but none were provided."
+                )
+            return expanded_prompt, None
+
+        prompt = self._collapse_image_spans(expanded_prompt)
+        image_token = tokenizer.convert_tokens_to_ids("<image>")
+        num_placeholders = prompt.count(image_token)
+
+        assert imgs_sizes is not None
+        is_video = num_frames is not None and bool(torch.any(num_frames > 1).item())
+        if is_video:
+            if int(num_frames.sum().item()) != int(imgs_sizes.shape[0]):
+                raise ValueError(
+                    "Video num_frames must partition imgs_sizes exactly: "
+                    f"sum(num_frames)={int(num_frames.sum().item())}, "
+                    f"imgs_sizes={imgs_sizes.shape[0]}."
+                )
+            _, media_model = self._inference_model_and_media_parts()
+            model_temporal_patch_size = int(
+                getattr(
+                    getattr(media_model, "vision_model", None),
+                    "temporal_patch_dim",
+                    1,
+                )
+            )
+            temporal_patch_size = int(
+                self.cfg["generation"]["mcore_generation_config"].get(
+                    "video_temporal_patch_size", model_temporal_patch_size
+                )
+            )
+            expected_placeholders = sum(
+                (int(frame_count) + temporal_patch_size - 1)
+                // temporal_patch_size
+                for frame_count in num_frames.tolist()
+            )
+            if num_placeholders != expected_placeholders:
+                raise ValueError(
+                    f"Video prompt has {num_placeholders} placeholder(s), "
+                    f"expected {expected_placeholders} tubelet placeholder(s)."
+                )
+            multi_modal_data: dict[str, Any] = {
+                "video": {
+                    "imgs": imgs,
+                    "imgs_sizes": imgs_sizes,
+                    "num_frames": num_frames,
+                }
+            }
+            if media_cache_key is not None:
+                multi_modal_data["media_cache_key"] = media_cache_key
+            return prompt, multi_modal_data
+
+        if int(imgs_sizes.shape[0]) != num_placeholders:
+            raise ValueError(
+                f"Image prompt has {num_placeholders} placeholder(s) "
+                f"for {imgs_sizes.shape[0]} imgs_sizes row(s)."
+            )
+        multi_modal_data = {
+            "image": {"imgs": imgs, "imgs_sizes": imgs_sizes}
+        }
+        if media_cache_key is not None:
+            multi_modal_data["media_cache_key"] = media_cache_key
+        return prompt, multi_modal_data
+
+    def _sample_vision_tensors(self, data, index: int):
+        """Return per-sample vision tensors from RL processor PackedTensors."""
+        from nemo_rl.data.multimodal_utils import PackedTensor
+
+        pixel_values = data.get("pixel_values")
+        imgs_sizes = data.get("imgs_sizes")
+        packed_num_frames = data.get("num_frames")
+        if pixel_values is None and imgs_sizes is None:
+            if packed_num_frames is not None:
+                raise ValueError("num_frames was provided without vision tensors.")
+            return None, None, None
+        if pixel_values is None or imgs_sizes is None:
+            raise ValueError(
+                "Megatron image generation requires both pixel_values and imgs_sizes."
+            )
+        if not isinstance(pixel_values, PackedTensor) or not isinstance(
+            imgs_sizes, PackedTensor
+        ):
+            raise TypeError(
+                "Megatron image generation expects pixel_values and imgs_sizes "
+                "as per-sample PackedTensor values."
+            )
+        if packed_num_frames is not None and not isinstance(
+            packed_num_frames, PackedTensor
+        ):
+            raise TypeError(
+                "Megatron video generation expects num_frames as a "
+                "per-sample PackedTensor value."
+            )
+
+        imgs = pixel_values.tensors[index]
+        sizes = imgs_sizes.tensors[index]
+        num_frames = (
+            packed_num_frames.tensors[index]
+            if packed_num_frames is not None
+            else None
+        )
+        if imgs is None and sizes is None:
+            return None, None, None
+        if imgs is None or sizes is None:
+            raise ValueError(
+                "Megatron image generation requires matching per-sample "
+                "pixel_values and imgs_sizes."
+            )
+
+        if imgs.ndim == 3:
+            imgs = imgs.unsqueeze(0)
+        if sizes.ndim == 1:
+            sizes = sizes.unsqueeze(0)
+        if num_frames is not None:
+            num_frames = num_frames.to(dtype=torch.int32).reshape(-1)
+        return imgs, sizes, num_frames
+
     def _prepare_data_for_generation(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
-    ) -> tuple[torch.Tensor, torch.Tensor, list[SamplingParams]]:
-        """Build the prompt tensors and a per-request SamplingParams for each sample."""
+    ) -> tuple[list[list[int]], list[Optional[Any]], list[SamplingParams]]:
+        """Build prompts, optional multimodal dictionaries, and sampling params."""
         if data is not None:
             assert isinstance(data, BatchedDataDict), (
                 f"data must be a BatchedDataDict, got type: {type(data)}"
@@ -545,21 +752,29 @@ class MegatronGenerationMixin:
                     f"Input to Megatron Generation worker is not properly right-padded: {error_msg}"
                 )
 
-        prompt_tokens_tensor = data["input_ids"].cuda()
-        prompt_lengths_tensor = data["input_lengths"]
-
         batch_stop_strings = data.get("stop_strings", [])
-        sampling_params = []
-        for i in range(prompt_tokens_tensor.size(0)):
+        prompts: list[list[int]] = []
+        multi_modal_data_list: list[Optional[Any]] = []
+        sampling_params: list[SamplingParams] = []
+        for i in range(data.size):
+            prompt, multi_modal_data = self._build_prompt_and_multimodal_data(data, i)
             sample_stop_strings = (
                 batch_stop_strings[i] if i < len(batch_stop_strings) else None
             )
             stop_words = self._merge_stop_strings(
                 [sample_stop_strings] if sample_stop_strings else None
             )
-            sampling_params.append(self._build_sampling_params(greedy, stop_words))
+            prompts.append(prompt)
+            multi_modal_data_list.append(multi_modal_data)
+            sampling_params.append(
+                self._build_sampling_params(
+                    greedy,
+                    stop_words,
+                    return_prompt_tokens=multi_modal_data is not None,
+                )
+            )
 
-        return prompt_tokens_tensor, prompt_lengths_tensor, sampling_params
+        return prompts, multi_modal_data_list, sampling_params
 
     def _parse_result_to_batched_data_dict(
         self,
@@ -572,6 +787,22 @@ class MegatronGenerationMixin:
         batch_size = input_ids.size(0)
         max_gen_seq_len = max(len(x.generated_tokens) for x in result)
         padded_input_length = input_ids.size(1)
+
+        expected_prompt_lengths = [int(length) for length in input_lengths.tolist()]
+        inference_prompt_lengths = [
+            len(x.prompt_tokens)
+            if getattr(x, "prompt_tokens", None) is not None
+            else expected_prompt_lengths[i]
+            for i, x in enumerate(result)
+        ]
+        if any(getattr(x, "prompt_tokens", None) is not None for x in result):
+            if inference_prompt_lengths != expected_prompt_lengths:
+                raise RuntimeError(
+                    "Megatron image prompt expansion does not match the training "
+                    "processor's input lengths: "
+                    f"inference={inference_prompt_lengths}, "
+                    f"training={expected_prompt_lengths}."
+                )
 
         max_seq_len = padded_input_length + max_gen_seq_len
         output_ids_padded = torch.full(
@@ -642,22 +873,20 @@ class MegatronGenerationMixin:
                 - generation_lengths: Lengths of each response
                 - unpadded_sequence_lengths: Lengths of each input + generated sequence
         """
-        prompt_tokens_tensor, prompt_lengths_tensor, sampling_params = (
+        prompts, multi_modal_data_list, sampling_params = (
             self._prepare_data_for_generation(data, greedy)
         )
-        if self._inference_loop is None:
+        if self.llm is None:
             raise RuntimeError(
-                "Inference loop not initialized. Call prepare_for_generation() first."
+                "Inference engine not initialized. Call prepare_for_generation() first."
             )
-        future = asyncio.run_coroutine_threadsafe(
+        result = self.llm.run_sync(
             self._generate_with_persistent_engine(
-                prompt_tokens_tensor,
-                prompt_lengths_tensor,
+                prompts,
+                multi_modal_data_list,
                 sampling_params,
-            ),
-            self._inference_loop,
+            )
         )
-        result = future.result()
 
         return self._parse_result_to_batched_data_dict(data, result)
 
@@ -673,27 +902,23 @@ class MegatronGenerationMixin:
         Yields:
             Tuple of (original_index, BatchedDataDict conforming to GenerationOutputSpec for the single sequence)
         """
-        if self._inference_loop is None:
+        if self.llm is None:
             raise RuntimeError(
-                "Inference loop not initialized. Call prepare_for_generation() first."
+                "Inference engine not initialized. Call prepare_for_generation() first."
             )
 
         async def _generate_single_item(
             index: int,
         ) -> tuple[int, BatchedDataDict[GenerationOutputSpec]]:
             datum = data.get_batch(index, 1)
-            prompt_tokens_tensor, prompt_lengths_tensor, sampling_params = (
+            prompts, multi_modal_data_list, sampling_params = (
                 self._prepare_data_for_generation(datum, greedy)
             )
-            future = asyncio.run_coroutine_threadsafe(
-                self._generate_with_persistent_engine(
-                    prompt_tokens_tensor,
-                    prompt_lengths_tensor,
-                    sampling_params,
-                ),
-                self._inference_loop,
+            result = await self._generate_with_persistent_engine(
+                prompts,
+                multi_modal_data_list,
+                sampling_params,
             )
-            result = await asyncio.wrap_future(future)
             output = self._parse_result_to_batched_data_dict(datum, result)
             return (index, output)
 
@@ -705,32 +930,31 @@ class MegatronGenerationMixin:
 
     async def _generate_with_persistent_engine(
         self,
-        prompt_tokens_tensor: torch.Tensor,
-        prompt_lengths_tensor: torch.Tensor,
+        prompts: list[list[int]],
+        multi_modal_data_list: list[Optional[Any]],
         sampling_params: list[SamplingParams],
     ) -> list:
-        """Submit requests through the persistent inference client (rank 0 only)."""
-        from megatron.core.inference.inference_request import DynamicInferenceRequest
-
+        """Submit one request per sample to the persistent MegatronAsyncLLM (rank 0 only)."""
         dist_rank = torch.distributed.get_rank()
         assert dist_rank == 0, (
-            "Only rank 0 creates a client to communicate with the coordinator"
+            "Only rank 0 submits requests to the inference coordinator"
         )
 
-        print(
-            f"[Rank {dist_rank}] Submitting {prompt_tokens_tensor.size(0)} requests to coordinator"
-        )
+        print(f"[Rank {dist_rank}] Submitting {len(prompts)} requests to coordinator")
 
-        futures = []
-        for prompt_tokens, prompt_len, request_sampling_params in zip(
-            prompt_tokens_tensor, prompt_lengths_tensor, sampling_params, strict=True
+        coros = []
+        for prompt, multi_modal_data, request_sampling_params in zip(
+            prompts, multi_modal_data_list, sampling_params, strict=True
         ):
-            prompt = prompt_tokens[: prompt_len.item()].tolist()
-            futures.append(
-                self.inference_client.add_request(prompt, request_sampling_params)
+            coros.append(
+                self.llm.generate(
+                    prompt,
+                    request_sampling_params,
+                    multi_modal_data=multi_modal_data,
+                )
             )
 
-        results: list[DynamicInferenceRequest] = await asyncio.gather(*futures)
+        results = await asyncio.gather(*coros)
         print(f"[Rank {dist_rank}] Completed {len(results)} requests")
         return results
 
@@ -753,16 +977,8 @@ class MegatronGenerationRefitMixin:
             port: Port for the process group rendezvous.
             world_size: Total world size (train + inference workers).
             rank_offset: Offset for this side's ranks (`train_world_size` for inference).
-            refit_backend: Copy-service backend ("gloo" or "nccl";
-                "nvshmem" is currently broken, see the issue below).
+            refit_backend: Copy-service backend ("gloo", "nccl", or "nvshmem").
         """
-        if refit_backend == "nvshmem":
-            warnings.warn(
-                'refit_backend="nvshmem" is currently broken; prefer "nccl" or '
-                '"gloo". See https://github.com/NVIDIA-NeMo/RL/issues/3646',
-                stacklevel=2,
-            )
-
         from torch.distributed.distributed_c10d import (
             PrefixStore,
             ProcessGroup,
@@ -833,15 +1049,22 @@ class MegatronGenerationRefitMixin:
         _world.pg_names[pg] = group_name
 
         if refit_backend == "nvshmem":
-            # Deferred: importing NVSHMEMCopyService loads the optional nvshmem bindings.
             from megatron.core.resharding.copy_services.nvshmem_copy_service import (
                 NVSHMEMCopyService,
             )
 
             self.refit_copy_service = NVSHMEMCopyService(group=self.refit_pg)
         elif refit_backend == "nccl":
+            from megatron.core.resharding.copy_services.nccl_copy_service import (
+                NCCLCopyService,
+            )
+
             self.refit_copy_service = NCCLCopyService(group=self.refit_pg)
         else:
+            from megatron.core.resharding.copy_services.gloo_copy_service import (
+                GlooCopyService,
+            )
+
             self.refit_copy_service = GlooCopyService(group=self.refit_pg)
 
         is_source = rank_offset == 0
@@ -897,14 +1120,15 @@ class MegatronGenerationRefitMixin:
         return True
 
     def _onload_inference_model(self) -> None:
-        """Restore the colocated inference weights to GPU before resharding / generation."""
+        """Restore the colocated inference weights to GPU before resharding."""
         if not self._inference_model_offloaded:
             return
+
         resume_inference_weights()
         self._inference_model_offloaded = False
 
     def _offload_inference_model(self) -> None:
-        """Offload the colocated inference weights to CPU while training runs."""
+        """Offload the colocated inference weights while training runs."""
         if (
             self.inference_model is None
             or self._inference_model_offloaded
@@ -915,25 +1139,20 @@ class MegatronGenerationRefitMixin:
         self._inference_model_offloaded = True
 
     def _reshard_into_inference_model(self) -> None:
-        """Reshard current training weights into the colocated inference-layout model."""
+        """Reshard training weights into the colocated inference-layout model."""
         inference_model = self.inference_model
         if inference_model is None:
             return
 
-        # Bring the inference weights back to GPU.
         self._onload_inference_model()
         self.model = self.move_model(
             self.model, "cuda", move_params=True, move_grads=False
         )
-        # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
 
-        # The swap reads the training params as its source;
-        # under overlap_param_gather they stay stale after the optimizer step until gathered.
         if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
             self._disable_forward_pre_hook_until_next_train_step(param_sync=True)
 
-        # Build + cache the same-rank reshard plan once, before the first CUDA-graph capture.
         if not self._swap_weights_plan_prepared:
             prepare_swap_model_weights(
                 src_model=self.model,
@@ -954,11 +1173,9 @@ class MegatronGenerationRefitMixin:
             src_rank_offset=0,
             dst_rank_offset=0,
         )
-        # Offload training model.
         self.model = self.move_model(
             self.model, "cpu", move_params=True, move_grads=False
         )
-        # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
 
     def suspend_for_refit(self) -> None:

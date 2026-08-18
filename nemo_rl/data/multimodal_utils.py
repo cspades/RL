@@ -21,6 +21,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional, Union
 
 import requests
@@ -915,6 +916,29 @@ def extract_input_image_sources_from_responses_messages(
     return sources
 
 
+def extract_input_video_sources_from_responses_messages(messages: Any) -> list[Any]:
+    """Extract video sources from Responses-API messages in encounter order."""
+    if not isinstance(messages, list):
+        return []
+
+    sources: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content") or []
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") not in VIDEO_CONTENT_TYPES:
+                continue
+            source = part.get("video") or part.get("video_url") or part.get("url")
+            if isinstance(source, dict):
+                source = source.get("url")
+            if source is not None:
+                sources.append(source)
+    return sources
+
+
 def extract_input_images_from_responses_messages(
     messages: Any,
 ) -> list[Image.Image]:
@@ -1030,29 +1054,45 @@ def attach_image_model_inputs_to_message(
     )
 
 
-def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
-    """Replace local image paths in NeMo Gym examples with base64 data URLs.
+_VIDEO_EXT_TO_MIME = {
+    ".mp4": "mp4",
+    ".m4v": "mp4",
+    ".mov": "quicktime",
+    ".webm": "webm",
+    ".mkv": "x-matroska",
+    ".avi": "x-msvideo",
+}
 
-    Walks each example's ``responses_create_params.input[].content[]`` items
-    and rewrites any ``input_image`` part whose ``image_url`` is a local path
-    (or ``file://`` URL) into a base64 ``data:`` URL via
-    :func:`image_to_data_url`. Parts whose URL already starts with ``http://``,
-    ``https://``, or ``data:`` are left untouched. Malformed items (non-dict
-    entries, missing/empty URLs, non-list ``input``/``content``) are skipped
-    without raising.
 
-    The examples are mutated in place; the same list is also returned for
-    convenience so callers can chain the call.
+def video_path_to_data_url(video_path: str) -> str:
+    """Inline a local or ``file://`` video as a base64 data URL."""
+    if video_path.startswith("data:"):
+        return video_path
 
-    Args:
-        nemo_gym_examples: List of NeMo Gym example dicts. Each example is
-            expected to contain a ``responses_create_params`` mapping with an
-            ``input`` list of Responses API messages.
+    resolved = (
+        video_path.removeprefix("file://")
+        if video_path.startswith("file://")
+        else str(Path(video_path).expanduser().resolve())
+    )
+    path = Path(resolved)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Video path resolved to {resolved!r}, which does not exist."
+        )
 
-    Returns:
-        The same ``nemo_gym_examples`` list, with local image references
-        rewritten to base64 data URLs in place.
-    """
+    ext = path.suffix.lower()
+    mime = _VIDEO_EXT_TO_MIME.get(ext)
+    if mime is None:
+        raise ValueError(
+            f"Unsupported video extension {ext!r} for {resolved!r}. "
+            f"Supported: {sorted(_VIDEO_EXT_TO_MIME)}."
+        )
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:video/{mime};base64,{encoded}"
+
+
+def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
+    """Canonicalize Gym image/video parts and inline local paths."""
     for example in nemo_gym_examples:
         input_items = example.get("responses_create_params", {}).get("input", [])
         if not isinstance(input_items, list):
@@ -1064,26 +1104,58 @@ def encode_images_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
             if not isinstance(content, list):
                 continue
             for part in content:
-                if (
-                    not isinstance(part, dict)
-                    or part.get("type") not in IMAGE_CONTENT_TYPES
-                ):
+                if not isinstance(part, dict):
                     continue
-                media_key = next(
-                    (key for key in ("image_url", "image", "url") if key in part),
-                    None,
+                part_type = part.get("type")
+                if part_type in IMAGE_CONTENT_TYPES:
+                    source_keys = ("image_url", "image", "url")
+                    canonical_type = "input_image"
+                    canonical_key = "image_url"
+                    is_image = True
+                elif part_type in VIDEO_CONTENT_TYPES:
+                    source_keys = ("video_url", "video", "url")
+                    canonical_type = "input_video"
+                    canonical_key = "video_url"
+                    is_image = False
+                else:
+                    continue
+
+                present_keys = [key for key in source_keys if key in part]
+                if not present_keys and part_type == "input_image" and "file_id" in part:
+                    continue
+                if len(present_keys) != 1:
+                    raise ValueError(
+                        f"{part_type} requires exactly one of {source_keys}"
+                    )
+
+                source = part[present_keys[0]]
+                nested_detail = source.get("detail") if isinstance(source, dict) else None
+                url = (
+                    source.get("url") or source.get("path", "")
+                    if isinstance(source, dict)
+                    else source
                 )
-                if media_key is None:
-                    continue
-                url = part.get(media_key)
-                if isinstance(url, dict):
-                    url = url.get("url") or url.get("path") or ""
                 if not isinstance(url, str) or not url:
-                    continue
-                if url.startswith(("http://", "https://", "data:")):
-                    continue
-                part[media_key] = image_to_data_url(resolve_to_image(url))
+                    raise ValueError(f"{part_type} requires a non-empty media URL")
+                if not url.startswith(("http://", "https://", "data:")):
+                    url = (
+                        image_to_data_url(resolve_to_image(url))
+                        if is_image
+                        else video_path_to_data_url(url)
+                    )
+
+                for key in source_keys:
+                    if key != canonical_key:
+                        part.pop(key, None)
+                part["type"] = canonical_type
+                part[canonical_key] = url
+                if is_image and nested_detail is not None:
+                    part.setdefault("detail", nested_detail)
     return nemo_gym_examples
+
+
+# Backward-compatible alias for existing callers.
+encode_images_in_examples = normalize_media_in_examples
 
 
 def get_media_from_message(message: dict[str, Any]) -> dict[str, list[Any]]:
