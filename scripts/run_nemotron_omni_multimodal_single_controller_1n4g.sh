@@ -37,9 +37,9 @@ esac
 CONFIG="${CONFIG:-${DEFAULT_CONFIG}}"
 MAX_STEPS="${MAX_STEPS:-4}"
 TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))}"
-MAX_STALENESS_VERSIONS="${MAX_STALENESS_VERSIONS:-2}"
-MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-${NUM_PROMPTS_PER_STEP}}"
-MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-32}"
+MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-1}"
+MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-$((NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1)))}"
+MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-$((NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1)))}"
 TRAIN_GPUS="${TRAIN_GPUS:-2}"
 GEN_GPUS="${GEN_GPUS:-2}"
 POLICY_TP="${POLICY_TP:-${TRAIN_GPUS}}"
@@ -279,7 +279,7 @@ COMMON_OVERRIDES=(
   ++policy.generation.mcore_generation_config.async_sched_mode=async
   ++policy.generation.mcore_generation_config.logprobs_mode=raw_logprobs
   ++policy.generation.mcore_generation_config.vision_embedding_cache_max_bytes="${VISION_EMBEDDING_CACHE_MAX_BYTES}"
-  policy.generation.mcore_generation_config.enable_prefix_caching=true
+  policy.generation.mcore_generation_config.enable_prefix_caching=false
   grpo.async_grpo=null
   grpo.num_prompts_per_step="${NUM_PROMPTS_PER_STEP}"
   grpo.num_generations_per_prompt="${NUM_GENERATIONS_PER_PROMPT}"
@@ -289,8 +289,8 @@ COMMON_OVERRIDES=(
   grpo.val_at_end=false
   grpo.overlong_filtering=false
   loss_fn.use_importance_sampling_correction=true
-  async_rl.sampler.name=windowed
-  async_rl.sampler.max_staleness_versions="${MAX_STALENESS_VERSIONS}"
+  async_rl.sampler.name=in_order
+  async_rl.sampler.max_lookahead_versions="${MAX_LOOKAHEAD_VERSIONS}"
   async_rl.recompute_kv_cache_after_weight_updates=false
   async_rl.min_groups_for_streaming_train="${NUM_PROMPTS_PER_STEP}"
   async_rl.max_inflight_prompts="${MAX_INFLIGHT_PROMPTS}"
@@ -302,7 +302,7 @@ COMMON_OVERRIDES=(
 )
 
 echo "Launching NeMo-RL v2 Omni ${TASK}: ${TRAIN_GPUS} train + ${GEN_GPUS} generation GPUs"
-echo "  SingleController async sampler: windowed, max staleness ${MAX_STALENESS_VERSIONS}"
+echo "  SingleController async sampler: in_order, max lookahead ${MAX_LOOKAHEAD_VERSIONS}"
 echo "  Megatron generation: TP=${INFER_TP} EP=${INFER_EP}, ${MEGATRON_TRANSFORMER_IMPL}, CG=${MEGATRON_CUDA_GRAPH_IMPL}, MoE padding=${MOE_PAD_EXPERTS_FOR_CG}"
 
 exec uv run --no-sync python examples/run_grpo_single_controller.py \
