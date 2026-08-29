@@ -131,7 +131,6 @@ def main() -> None:
                 str(source),
                 "--output",
                 str(output),
-                "--require-video",
             ],
             cwd=repo_root,
             check=True,

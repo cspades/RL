@@ -152,6 +152,12 @@ VIDEO_TARGET_PATCHES="${VIDEO_TARGET_PATCHES:-1024}"
 NUM_DATA_ROWS="${NUM_DATA_ROWS:-256}"
 NUM_PROMPTS="${NUM_PROMPTS:-$((INFERENCE_DP_SIZE * 2))}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
+VAL_PERIOD="${VAL_PERIOD:-10}"
+VAL_AT_START="${VAL_AT_START:-true}"
+VAL_AT_END="${VAL_AT_END:-true}"
+VAL_NUM_GENERATIONS="${VAL_NUM_GENERATIONS:-1}"
+VAL_GBS="${VAL_GBS:-2}"
+VAL_SIZE="${VAL_SIZE:-2}"
 TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS * NUM_GENERATIONS))}"
 EXPECTED_TRAIN_GBS=$((NUM_PROMPTS * NUM_GENERATIONS))
 if (( TRAIN_GBS != EXPECTED_TRAIN_GBS )); then
@@ -160,6 +166,10 @@ if (( TRAIN_GBS != EXPECTED_TRAIN_GBS )); then
 fi
 if (( TRAIN_GBS % TRAIN_DP_SIZE != 0 )); then
   echo "TRAIN_GBS (${TRAIN_GBS}) must be divisible by training DP size (${TRAIN_DP_SIZE})." >&2
+  exit 1
+fi
+if (( VAL_GBS <= 0 || VAL_SIZE < VAL_GBS )); then
+  echo "VAL_GBS must be positive and no larger than VAL_SIZE." >&2
   exit 1
 fi
 
@@ -462,7 +472,12 @@ grpo.async_grpo.in_flight_weight_updates=${IN_FLIGHT_WEIGHT_UPDATES} \
 loss_fn.use_importance_sampling_correction=true \
 grpo.num_prompts_per_step=${NUM_PROMPTS} \
 grpo.num_generations_per_prompt=${NUM_GENERATIONS} \
-grpo.val_num_generations_per_prompt=1 \
+grpo.val_num_generations_per_prompt=${VAL_NUM_GENERATIONS} \
+grpo.val_period=${VAL_PERIOD} \
+grpo.val_at_start=${VAL_AT_START} \
+grpo.val_at_end=${VAL_AT_END} \
+grpo.val_batch_size=${VAL_GBS} \
+grpo.max_val_samples=${VAL_SIZE} \
 policy.train_global_batch_size=${TRAIN_GBS} \
 grpo.max_num_steps=${MAX_STEPS} \
 checkpointing.enabled=${CHECKPOINTING_ENABLED} \
@@ -492,6 +507,7 @@ fi
 echo "  seq/new_tokens: ${MAX_SEQUENCE_LENGTH}/${MAX_NEW_TOKENS}"
 echo "  thinking enabled: ${ENABLE_THINKING}"
 echo "  prompts/generations/train_gbs: ${NUM_PROMPTS}/${NUM_GENERATIONS}/${TRAIN_GBS}"
+echo "  validation: every ${VAL_PERIOD} steps, at_start=${VAL_AT_START}, at_end=${VAL_AT_END}, batch/size/generations=${VAL_GBS}/${VAL_SIZE}/${VAL_NUM_GENERATIONS}"
 echo "  async: max_trajectory_age=${MAX_TRAJECTORY_AGE_STEPS} in_flight_weight_updates=${IN_FLIGHT_WEIGHT_UPDATES}"
 echo "  video: frames=${NUM_FRAMES} temporal_patch=${TEMPORAL_PATCH_SIZE} target_patches=${VIDEO_TARGET_PATCHES}"
 echo "  VSTAT: root=${DATA_ROOT} repo=${HF_DATASET} rows=${NUM_DATA_ROWS} prepare=${PREPARE_VSTAT} (head only; also runs if JSONL is missing)"
