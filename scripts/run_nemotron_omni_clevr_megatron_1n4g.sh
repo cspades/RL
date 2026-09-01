@@ -14,7 +14,7 @@ set -euo pipefail
 NEMORL="${NEMORL:-/opt/nemo-rl}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-${NEMORL}/workspace}"
 MODEL_NAME="${MODEL_NAME:-nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}"
-CONFIG="${CONFIG:-examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n4g-megatron_generation.v1.yaml}"
+CONFIG="${CONFIG:-examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron_generation.v1.yaml}"
 GENERATION_BACKEND="${GENERATION_BACKEND:-megatron}"
 COLOCATED="${COLOCATED:-false}"
 ASYNC_GRPO="${ASYNC_GRPO:-true}"

@@ -144,9 +144,8 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export NRL_VENVS_TRUST_EXISTING="${NRL_VENVS_TRUST_EXISTING:-1}"
 export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-/opt/ray_venvs}"
-# The Gym env servers run in their own venvs; keep them beside the NeMo-RL ones
-# so a warm container does not rebuild them on every launch.
-export NEMO_GYM_VENV_DIR="${NEMO_GYM_VENV_DIR:-${NEMO_RL_VENV_DIR}}"
+# Gym server environments are distinct from NeMo-RL worker environments.
+export NEMO_GYM_VENV_DIR="${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-16}"
 export NVTE_BWD_LAYERNORM_SM_MARGIN="${NVTE_BWD_LAYERNORM_SM_MARGIN:-16}"

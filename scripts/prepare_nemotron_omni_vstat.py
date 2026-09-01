@@ -90,12 +90,22 @@ def main() -> None:
             f"{letters[index]}. {choice}"
             for index, choice in enumerate(choices)
         )
+        question = str(row["question"]).strip()
+        # VSTAT currently embeds parenthesized choices in many question
+        # strings. Append the separate choices column only when they are not
+        # already present, otherwise the model sees every option twice.
+        has_embedded_choices = all(
+            f"({letters[index]})" in question for index in range(len(choices))
+        )
+        question_with_options = (
+            question if has_embedded_choices else f"{question}\n{options}"
+        )
         converted.append(
             {
                 "prompt": (
                     "Answer the multiple-choice question using the video. "
                     "Return the final answer as a boxed letter.\n"
-                    f"Question: {row['question']}\n{options}"
+                    f"Question: {question_with_options}"
                 ),
                 "video": str(video_path),
                 "answer": str(row["answer"]).strip().upper(),
