@@ -79,6 +79,7 @@ fi
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-1}"
 MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-$((NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1)))}"
 MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-$((NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1)))}"
+ASYNC_RL_DIAGNOSTICS="${ASYNC_RL_DIAGNOSTICS:-false}"
 WANDB_ENABLED="${WANDB_ENABLED:-true}"
 EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
 REFIT_BACKEND="${REFIT_BACKEND:-nccl}"
@@ -127,7 +128,7 @@ case "${TASK}" in
     TASK_OVERRIDES=""
     ;;
   vstat)
-    CONFIG="${CONFIG:-examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-vstat-8n4g-megatron-single-controller-async.v1.yaml}"
+    CONFIG="${CONFIG:-examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml}"
     MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-8192}"
     MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
     # SingleController currently rejects validation during setup.
@@ -327,6 +328,7 @@ TRAIN_GBS=${TRAIN_GBS} \
 MAX_LOOKAHEAD_VERSIONS=${MAX_LOOKAHEAD_VERSIONS} \
 MAX_INFLIGHT_PROMPTS=${MAX_INFLIGHT_PROMPTS} \
 MAX_BUFFERED_ROLLOUTS=${MAX_BUFFERED_ROLLOUTS} \
+ASYNC_RL_DIAGNOSTICS=${ASYNC_RL_DIAGNOSTICS} \
 REFIT_BACKEND=${REFIT_BACKEND} \
 BUFFER_SIZE_GB=${BUFFER_SIZE_GB} \
 EXP_AVG_DTYPE=${EXP_AVG_DTYPE} \
@@ -372,11 +374,11 @@ policy.generation.mcore_generation_config.buffer_size_gb=${BUFFER_SIZE_GB} \
 ++policy.generation.mcore_generation_config.mamba_inference_conv_states_dtype=float32 \
 policy.generation.mcore_generation_config.max_model_len=${MAX_SEQUENCE_LENGTH} \
 policy.generation.mcore_generation_config.max_tokens=${MAX_SEQUENCE_LENGTH} \
-data_plane.enabled=true \
-data_plane.impl=transfer_queue \
-data_plane.backend=simple \
-data_plane.claim_meta_poll_interval_s=0.5 \
-data_plane.simple.num_storage_units=${NUM_STORAGE_UNITS} \
+++data_plane.enabled=true \
+++data_plane.impl=transfer_queue \
+++data_plane.backend=simple \
+++data_plane.claim_meta_poll_interval_s=0.5 \
+++data_plane.simple.num_storage_units=${NUM_STORAGE_UNITS} \
 grpo.val_period=${VAL_PERIOD} \
 grpo.val_at_start=${VAL_AT_START} \
 grpo.val_at_end=${VAL_AT_END} \

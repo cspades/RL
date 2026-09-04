@@ -226,9 +226,9 @@ exec env "${NSYS_ENV[@]}" uv run --no-sync python examples/nemo_gym/run_grpo_nem
   ++policy.generation.mcore_generation_config.video_target_num_patches="${VIDEO_TARGET_PATCHES}" \
   policy.max_total_sequence_length="${MAX_SEQUENCE_LENGTH}" \
   policy.generation.max_new_tokens="${MAX_NEW_TOKENS}" \
-  +data.default.num_frames="${NUM_FRAMES}" \
-  +data.default.video_sampling_style=nemotron_vl \
-  +data.default.video_temporal_patch_size="${TEMPORAL_PATCH_SIZE}" \
+  data.default.num_frames="${NUM_FRAMES}" \
+  data.default.video_sampling_style=nemotron_vl \
+  data.default.video_temporal_patch_size="${TEMPORAL_PATCH_SIZE}" \
   +data.default.min_generation_tokens="${MIN_GENERATION_TOKENS}" \
   data.default.video_target_num_patches="${VIDEO_TARGET_PATCHES}" \
   data.train.data_path="${NEMO_RL_VIDEO_TRAIN_JSONL}" \

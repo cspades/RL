@@ -15,14 +15,14 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-${NEMORL}/workspace}"
 
 case "${TASK}" in
   clevr)
-    DEFAULT_CONFIG="examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-1n4g-megatron-single-controller-async.v1.yaml"
+    DEFAULT_CONFIG="examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron-single-controller-async.v1.yaml"
     MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-2048}"
     MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
     NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-1}"
     NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-2}"
     ;;
   vstat)
-    DEFAULT_CONFIG="examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-vstat-1n4g-megatron-single-controller-async.v1.yaml"
+    DEFAULT_CONFIG="examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-16n8g-megatron-tp4ep4-async-gym-video.v1.yaml"
     MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-4096}"
     MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
     NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-2}"
@@ -40,6 +40,7 @@ TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))}"
 MAX_LOOKAHEAD_VERSIONS="${MAX_LOOKAHEAD_VERSIONS:-1}"
 MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-$((NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1)))}"
 MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-$((NUM_PROMPTS_PER_STEP * (MAX_LOOKAHEAD_VERSIONS + 1)))}"
+ASYNC_RL_DIAGNOSTICS="${ASYNC_RL_DIAGNOSTICS:-true}"
 TRAIN_GPUS="${TRAIN_GPUS:-2}"
 GEN_GPUS="${GEN_GPUS:-2}"
 POLICY_TP="${POLICY_TP:-${TRAIN_GPUS}}"
@@ -222,18 +223,24 @@ PY
     ++policy.generation.mcore_generation_config.video_num_frames="${NUM_FRAMES}"
     ++policy.generation.mcore_generation_config.video_temporal_patch_size="${TEMPORAL_PATCH_SIZE}"
     ++policy.generation.mcore_generation_config.video_target_num_patches="${VIDEO_TARGET_PATCHES}"
-    +data.default.num_frames="${NUM_FRAMES}"
-    +data.default.video_sampling_style=nemotron_vl
-    +data.default.video_temporal_patch_size="${TEMPORAL_PATCH_SIZE}"
+    data.default.num_frames="${NUM_FRAMES}"
+    data.default.video_sampling_style=nemotron_vl
+    data.default.video_temporal_patch_size="${TEMPORAL_PATCH_SIZE}"
     +data.default.min_generation_tokens="${MIN_GENERATION_TOKENS}"
     data.default.video_target_num_patches="${VIDEO_TARGET_PATCHES}"
     data.train.data_path="${TRAIN_JSONL}"
     data.validation.data_path="${VAL_JSONL}"
     ++env.nemo_gym.policy_model.responses_api_models.vllm_model.chat_template_kwargs.enable_thinking="${ENABLE_THINKING}"
+    grpo.deduplicate_multimodal_data=false
   )
 fi
 
 COMMON_OVERRIDES=(
+  ++data_plane.enabled=true
+  ++data_plane.impl=transfer_queue
+  ++data_plane.backend=simple
+  ++data_plane.claim_meta_poll_interval_s=0.5
+  ++data_plane.simple.num_storage_units=2
   cluster.num_nodes=1
   cluster.gpus_per_node="${GPUS_PER_NODE}"
   policy.model_name="${MODEL_NAME}"
@@ -289,12 +296,13 @@ COMMON_OVERRIDES=(
   grpo.val_at_end=false
   grpo.overlong_filtering=false
   loss_fn.use_importance_sampling_correction=true
-  async_rl.sampler.name=in_order
-  async_rl.sampler.max_lookahead_versions="${MAX_LOOKAHEAD_VERSIONS}"
-  async_rl.recompute_kv_cache_after_weight_updates=false
-  async_rl.min_groups_for_streaming_train="${NUM_PROMPTS_PER_STEP}"
-  async_rl.max_inflight_prompts="${MAX_INFLIGHT_PROMPTS}"
-  async_rl.max_buffered_rollouts="${MAX_BUFFERED_ROLLOUTS}"
+  ++async_rl.sampler.name=in_order
+  ++async_rl.sampler.max_lookahead_versions="${MAX_LOOKAHEAD_VERSIONS}"
+  ++async_rl.recompute_kv_cache_after_weight_updates=false
+  ++async_rl.min_groups_for_streaming_train="${NUM_PROMPTS_PER_STEP}"
+  ++async_rl.max_inflight_prompts="${MAX_INFLIGHT_PROMPTS}"
+  ++async_rl.max_buffered_rollouts="${MAX_BUFFERED_ROLLOUTS}"
+  ++async_rl.diagnostics="${ASYNC_RL_DIAGNOSTICS}"
   checkpointing.enabled=false
   logger.log_dir="${RESULTS_DIR}"
   logger.wandb_enabled="${WANDB_ENABLED}"
