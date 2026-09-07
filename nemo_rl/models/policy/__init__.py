@@ -411,6 +411,7 @@ class MegatronConfig(TypedDict):
     vision_recompute_granularity: NotRequired[str | None]
     vision_recompute_method: NotRequired[str | None]
     vision_recompute_num_layers: NotRequired[int | None]
+    truncate_num_layers: NotRequired[int | None]
     pipeline_dtype: str
     sequence_parallel: bool
     freeze_moe_router: bool

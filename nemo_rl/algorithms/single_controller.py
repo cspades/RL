@@ -202,6 +202,7 @@ from nemo_rl.utils.checkpoint import (
     PathLike,
 )
 from nemo_rl.utils.logger import TELEMETRY_WALL_TIME_METRIC, Logger
+from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 from nemo_rl.utils.train_data_dump import TrainDataDump
 
@@ -2793,6 +2794,24 @@ class SingleControllerActor:
         )
 
         while self._train_steps < self._algo_cfg.max_num_steps:
+            # Match the legacy loops' 1-indexed profiling window. The helper waits
+            # synchronously on Ray workers, so keep those waits off this actor's
+            # event loop while its rollout and watchdog pumps remain active.
+            profile_step = self._train_steps + 1
+            profile_targets = [self._trainer]
+            if self._gen is not None and self._gen is not self._trainer:
+                profile_targets.append(self._gen)
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        maybe_gpu_profile_step,
+                        target,
+                        profile_step,
+                    )
+                    for target in profile_targets
+                )
+            )
+
             version_during_step = self._trainer_version
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
