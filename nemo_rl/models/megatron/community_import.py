@@ -45,6 +45,7 @@ def iter_vlm_config_overrides(
         "vision_recompute_granularity",
         "vision_recompute_method",
         "vision_recompute_num_layers",
+        "truncate_num_layers",
     )
     for key in keys:
         if key in megatron_config:
