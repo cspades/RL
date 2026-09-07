@@ -213,6 +213,50 @@ def _validate_worker_extension_cls(
         )
 
 
+def _apply_nemotron_omni_layer_truncation(
+    vllm_kwargs: dict[str, Any], hf_config: Any
+) -> None:
+    """Translate NeMo-RL's debug truncation option into a valid nested HF config."""
+    truncate_num_layers = vllm_kwargs.pop("nemo_truncate_num_layers", None)
+    if truncate_num_layers is None:
+        return
+    if (
+        not isinstance(truncate_num_layers, int)
+        or isinstance(truncate_num_layers, bool)
+        or truncate_num_layers <= 0
+    ):
+        raise ValueError("nemo_truncate_num_layers must be a positive integer")
+
+    llm_config = getattr(hf_config, "llm_config", None)
+    layer_types = getattr(llm_config, "layers_block_type", None)
+    if not isinstance(layer_types, list):
+        raise ValueError(
+            "nemo_truncate_num_layers is only supported for Nemotron Omni "
+            "configs with llm_config.layers_block_type"
+        )
+    if truncate_num_layers > len(layer_types):
+        raise ValueError(
+            f"nemo_truncate_num_layers={truncate_num_layers} exceeds the "
+            f"{len(layer_types)} checkpoint layers"
+        )
+
+    base_overrides = dict(vllm_kwargs.get("hf_overrides") or {})
+
+    def apply_overrides(config: Any) -> Any:
+        config.update(base_overrides)
+        nested_llm_config = config.llm_config
+        nested_llm_config.layers_block_type = list(
+            nested_llm_config.layers_block_type[:truncate_num_layers]
+        )
+        nested_llm_config.num_nextn_predict_layers = 0
+        nested_llm_config.mtp_layers_block_type = []
+        return config
+
+    # vLLM's callable form preserves the typed nested config. A dictionary
+    # override would replace llm_config with a raw dict.
+    vllm_kwargs["hf_overrides"] = apply_overrides
+
+
 def _log_effective_quantization_ignore_patterns(
     vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]
 ) -> None:
@@ -718,6 +762,8 @@ class BaseVllmGenerationWorker:
         )
         _validate_worker_extension_cls(vllm_kwargs, default_worker_extension_cls)
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
+        _apply_nemotron_omni_layer_truncation(vllm_kwargs, hf_config)
+
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
