@@ -5,8 +5,9 @@ set -euo pipefail
 # The default non-colocated layout matches the NeMo-RL v1 parity launchers:
 # two training nodes and six Megatron generation nodes.
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
+NEMORL="$(cd "${NEMORL}" && pwd -P)"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-${NEMORL}/workspace}"
 TASK="${TASK:-clevr}"
@@ -271,8 +272,9 @@ PRECISION_RECIPE="${PRECISION_RECIPE:-bf16}"
 WANDB_PROJ="${WANDB_PROJ:-mllm-rl-dev}"
 WANDB_GROUP="${WANDB_GROUP:-adlr}"
 WANDB_NAME="${WANDB_NAME:-${EXP_NAME}-${PRECISION_RECIPE}-${WANDB_NAME_SUFFIX}}"
-CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
-SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-coreai_dlalgo_mcore}"
+# CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
+CONTAINER="/scratch/fsw/portfolios/coreai/users/cye/enroot/nrl_gym_nightly_arm_20260910.sqsh"
+SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-nemotron_sw_post}"
 SBATCH_PARTITION="${SBATCH_PARTITION:-batch_long}"
 SBATCH_QOS="${SBATCH_QOS:-}"
 SBATCH_TIME="${SBATCH_TIME:-04:00:00}"
@@ -418,9 +420,10 @@ policy.is_vlm=true \
 policy.max_total_sequence_length=${MAX_SEQUENCE_LENGTH} \
 policy.train_global_batch_size=${TRAIN_GBS} \
 policy.train_micro_batch_size=${TRAIN_MICRO_BATCH_SIZE} \
+policy.sequence_packing.enabled=true \
 cluster.num_nodes=${NUM_NODES} \
 cluster.gpus_per_node=${GPUS_PER_NODE} \
-cluster.segment_size=${SEGMENT_SIZE} \
+++cluster.segment_size=${SEGMENT_SIZE} \
 policy.megatron_cfg.tensor_model_parallel_size=${POLICY_TP} \
 policy.megatron_cfg.expert_model_parallel_size=${POLICY_EP} \
 policy.megatron_cfg.expert_tensor_parallel_size=1 \
@@ -551,6 +554,7 @@ if [[ -n "${SBATCH_RESERVATION}" ]]; then
   SBATCH_ARGS+=(--reservation="${SBATCH_RESERVATION}")
 fi
 
+cd "${NEMORL}"
 BASE_LOG_DIR="${SLURM_LOG_DIR}" \
-MOUNTS="${MOUNTS:-/lustre:/lustre},${NEMORL}:${CONTAINER_NEMORL}" \
+MOUNTS="${MOUNTS:-/scratch:/scratch},${NEMORL}:${CONTAINER_NEMORL}" \
 sbatch "${SBATCH_ARGS[@]}" "${NEMORL}/ray.sub"
