@@ -4,8 +4,9 @@ set -euo pipefail
 # Eight-node wrapper for the gated Nemotron 3.5 Super 67B vision checkpoint.
 # Defaults to a non-colocated 16-GPU training / 16-GPU generation split.
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
+export CONTAINER="${CONTAINER:-/scratch/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/asolergibert/images/archive/20260909-140140-nemo-rl-nightly-gym.sqsh}"
 export TASK="${TASK:-clevr}"
 export MODEL_NAME="${MODEL_NAME:-nvidia/NVIDIA-Nemotron-3.5-Super-midtrain-67B-vision-pretrained}"
 export JOB_NAME="${JOB_NAME:-nemotron-35-super-67b-vision-single-controller-8n4g}"
@@ -16,7 +17,7 @@ export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 export MAX_STEPS="${MAX_STEPS:-25}"
 # Tokens per request / rollout, i.e. prompt + generation tokens.
 export MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-49152}"
-# Per-step chunked-prefill token budget. 
+# Per-step chunked-prefill token budget.
 export INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-8192}"
 # Max generation tokens.
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
