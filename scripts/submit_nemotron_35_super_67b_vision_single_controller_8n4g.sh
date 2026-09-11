@@ -40,8 +40,15 @@ export POLICY_EP="${POLICY_EP:-16}"
 export POLICY_CP="${POLICY_CP:-2}"
 # Generation Parallelism
 export NUM_GEN_NODES="${NUM_GEN_NODES:-4}"
-export INFER_TP="${INFER_TP:-8}"
-export INFER_EP="${INFER_EP:-8}"
+export INFER_TP="${INFER_TP:-4}"
+export INFER_EP="${INFER_EP:-4}"
+export REFIT_TRANSPORT="${REFIT_TRANSPORT:-mcore}"
+# refit_backend is only valid for the native MCore refit transport.
+if [[ "${REFIT_TRANSPORT}" == "mcore" ]]; then
+  export REFIT_BACKEND="${REFIT_BACKEND:-nccl}"
+else
+  export REFIT_BACKEND="${REFIT_BACKEND:-null}"
+fi
 # GPU-resident attention KV blocks and reusable hybrid-Mamba prefix state.
 export BUFFER_SIZE_GB="${BUFFER_SIZE_GB:-16}"
 export PREFIX_CACHING_MAMBA_GB="${PREFIX_CACHING_MAMBA_GB:-20}"
@@ -73,7 +80,7 @@ TRAIN_DP_SIZE=$((NUM_TRAIN_NODES * GPUS_PER_NODE / (POLICY_TP * POLICY_CP)))
 export ENABLE_NSYS="${ENABLE_NSYS:-true}"
 export MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL="${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL:-100}"
 export WANDB_ENABLED="${WANDB_ENABLED:-true}"
-export WANDB_NAME="${WANDB_NAME:-nt-omni-super-67b-${TASK}-${NUM_NODES}n${GPUS_PER_NODE}g-tr${NUM_TRAIN_NODES}n-gen${NUM_GEN_NODES}n-tp${POLICY_TP}dp${TRAIN_DP_SIZE}ep${POLICY_EP}cp${POLICY_CP}-itp${INFER_TP}iep${INFER_EP}-seq${MAX_SEQUENCE_LENGTH}-trainmbtok${TRAIN_MB_TOKENS}lpmbtok${LOGPROB_MB_TOKENS}-p${NUM_PROMPTS_PER_STEP}g${NUM_GENERATIONS_PER_PROMPT}-gbs${TRAIN_GBS}mbs${TRAIN_MICRO_BATCH_SIZE}lpbs${LOGPROB_BATCH_SIZE}-cpuoff${OPTIMIZER_CPU_OFFLOAD}}"
-export EXTRA_OVERRIDES="++policy.sequence_packing.train_mb_tokens=${TRAIN_MB_TOKENS} ++policy.sequence_packing.logprob_mb_tokens=${LOGPROB_MB_TOKENS} ++policy.logprob_batch_size=${LOGPROB_BATCH_SIZE} ++policy.generation.mcore_generation_config.offload_policy_before_refit=${OFFLOAD_POLICY_BEFORE_REFIT} ++policy.megatron_cfg.empty_unused_memory_level=${EMPTY_UNUSED_MEMORY_LEVEL} ${EXTRA_OVERRIDES:-}"
+export WANDB_NAME="${WANDB_NAME:-nt-omni-super-67b-${TASK}-${NUM_NODES}n${GPUS_PER_NODE}g-tr${NUM_TRAIN_NODES}n-gen${NUM_GEN_NODES}n-refit${REFIT_TRANSPORT}-tp${POLICY_TP}dp${TRAIN_DP_SIZE}ep${POLICY_EP}cp${POLICY_CP}-itp${INFER_TP}iep${INFER_EP}-seq${MAX_SEQUENCE_LENGTH}-trainmbtok${TRAIN_MB_TOKENS}lpmbtok${LOGPROB_MB_TOKENS}-p${NUM_PROMPTS_PER_STEP}g${NUM_GENERATIONS_PER_PROMPT}-gbs${TRAIN_GBS}mbs${TRAIN_MICRO_BATCH_SIZE}lpbs${LOGPROB_BATCH_SIZE}-cpuoff${OPTIMIZER_CPU_OFFLOAD}}"
+export EXTRA_OVERRIDES="++policy.generation.refit_transport=${REFIT_TRANSPORT} ++policy.sequence_packing.train_mb_tokens=${TRAIN_MB_TOKENS} ++policy.sequence_packing.logprob_mb_tokens=${LOGPROB_MB_TOKENS} ++policy.logprob_batch_size=${LOGPROB_BATCH_SIZE} ++policy.generation.mcore_generation_config.offload_policy_before_refit=${OFFLOAD_POLICY_BEFORE_REFIT} ++policy.megatron_cfg.empty_unused_memory_level=${EMPTY_UNUSED_MEMORY_LEVEL} ${EXTRA_OVERRIDES:-}"
 
 exec bash "${SCRIPT_DIR}/submit_nemotron_omni_multimodal_single_controller_8n4g.sh" "$@"

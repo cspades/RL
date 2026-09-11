@@ -118,6 +118,7 @@ MONITOR_GPUS="${MONITOR_GPUS:-${WANDB_ENABLED}}"
 GPU_MONITORING_COLLECTION_INTERVAL="${GPU_MONITORING_COLLECTION_INTERVAL:-10}"
 GPU_MONITORING_FLUSH_INTERVAL="${GPU_MONITORING_FLUSH_INTERVAL:-10}"
 EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
+REFIT_TRANSPORT="${REFIT_TRANSPORT:-mcore}"
 REFIT_BACKEND="${REFIT_BACKEND:-nccl}"
 BUFFER_SIZE_GB="${BUFFER_SIZE_GB:-8}"
 OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-false}"
@@ -342,12 +343,7 @@ fi
 
 export SETUP_COMMAND=""
 if [[ "${TASK}" == "vstat" ]]; then
-  # NOTE: Remove the rm when the RL nightly container is unscrewed
-  # and correctly installs the new Gym venv's.
-  export SETUP_COMMAND="rm -rf \
-  /opt/ray_venvs/nemo_rl.environments.nemo_gym.NemoGym \
-  /opt/gym_venvs
-cd ${CONTAINER_NEMORL} && bash tools/install_audio_deps.sh"
+  export SETUP_COMMAND="cd ${CONTAINER_NEMORL} && bash tools/install_audio_deps.sh"
 fi
 
 DRIVER_TASK_SETUP=""
@@ -464,6 +460,7 @@ policy.generation.mcore_generation_config.num_cuda_graphs=${MEGATRON_NUM_CUDA_GR
 policy.generation.mcore_generation_config.use_cuda_graphs_for_non_decode_steps=${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE} \
 ++policy.generation.mcore_generation_config.logging_step_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL} \
 policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference=${MOE_PAD_EXPERTS_FOR_CG} \
+++policy.generation.refit_transport=${REFIT_TRANSPORT} \
 policy.generation.mcore_generation_config.refit_backend=${REFIT_BACKEND} \
 policy.generation.mcore_generation_config.buffer_size_gb=${BUFFER_SIZE_GB} \
 ++policy.generation.mcore_generation_config.kv_cache_management_mode=persist \
@@ -496,6 +493,7 @@ loss_fn.use_importance_sampling_correction=true \
 ++async_rl.max_inflight_prompts=${MAX_INFLIGHT_PROMPTS} \
 ++async_rl.max_buffered_rollouts=${MAX_BUFFERED_ROLLOUTS} \
 ++async_rl.diagnostics=${ASYNC_RL_DIAGNOSTICS} \
+++async_rl.generation_fleet_health.refit_timeout_s=null \
 checkpointing.enabled=${CHECKPOINTING_ENABLED} \
 checkpointing.checkpoint_dir=${RESULTS_DIR} \
 checkpointing.metric_name=null \
@@ -519,7 +517,7 @@ echo "  max model parallel GPUs / segment nodes: ${MAX_MODEL_PARALLEL_SIZE}/${SE
 echo "  prompts/generations/train_gbs: ${NUM_PROMPTS_PER_STEP}/${NUM_GENERATIONS_PER_PROMPT}/${TRAIN_GBS}"
 echo "  async sampler/lookahead/inflight/buffer: in_order/${MAX_LOOKAHEAD_VERSIONS}/${MAX_INFLIGHT_PROMPTS}/${MAX_BUFFERED_ROLLOUTS}"
 echo "  sequence/inference-step/new tokens: ${MAX_SEQUENCE_LENGTH}/${INFERENCE_MAX_TOKENS}/${MAX_NEW_TOKENS}"
-echo "  generation: colocated=${COLOCATED} async=${ASYNC_GRPO} refit=${REFIT_BACKEND}"
+echo "  generation: colocated=${COLOCATED} async=${ASYNC_GRPO} refit=${REFIT_TRANSPORT}/${REFIT_BACKEND}"
 echo "  Megatron: transformer=${MEGATRON_TRANSFORMER_IMPL} chunked_prefill=${MEGATRON_ENABLE_CHUNKED_PREFILL} prefix_caching=${ENABLE_PREFIX_CACHING} logging_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL}"
 echo "  CUDA graphs: impl=${MEGATRON_CUDA_GRAPH_IMPL} scope=${MEGATRON_CUDA_GRAPH_SCOPE} count=${MEGATRON_NUM_CUDA_GRAPHS} non_decode=${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE} moe_padding=${MOE_PAD_EXPERTS_FOR_CG}"
 echo "  optimizer: cpu_offload=${OPTIMIZER_CPU_OFFLOAD} offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION} overlap_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} logprob_offload=${OFFLOAD_OPTIMIZER_FOR_LOGPROB}"
