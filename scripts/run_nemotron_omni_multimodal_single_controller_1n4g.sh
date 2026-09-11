@@ -56,6 +56,7 @@ else
 fi
 INFER_TP="${INFER_TP:-${GEN_GPUS}}"
 INFER_EP="${INFER_EP:-${GEN_GPUS}}"
+REFIT_TRANSPORT="${REFIT_TRANSPORT:-mcore}"
 REFIT_BACKEND="${REFIT_BACKEND:-nccl}"
 BUFFER_SIZE_GB="${BUFFER_SIZE_GB:-8}"
 MEGATRON_TRANSFORMER_IMPL="${MEGATRON_TRANSFORMER_IMPL:-inference_optimized}"
@@ -267,7 +268,8 @@ COMMON_OVERRIDES=(
   policy.megatron_cfg.bias_activation_fusion=false
   policy.megatron_cfg.optimizer.optimizer_cpu_offload=false
   policy.megatron_cfg.optimizer.optimizer_offload_fraction=0.0
-  policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=false
+  policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=true
+  policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=true
   "${OPTIMIZER_PRECISION_OVERRIDES[@]}"
   policy.generation.backend=megatron
   ++policy.generation.stop_strings=null
@@ -287,7 +289,8 @@ COMMON_OVERRIDES=(
   policy.generation.mcore_generation_config.transformer_impl="${MEGATRON_TRANSFORMER_IMPL}"
   policy.generation.mcore_generation_config.sequence_parallel=true
   policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference="${MOE_PAD_EXPERTS_FOR_CG}"
-  policy.generation.mcore_generation_config.refit_backend="${REFIT_BACKEND}"
+  ++policy.generation.refit_transport="${REFIT_TRANSPORT}"
+  ++policy.generation.mcore_generation_config.refit_backend="${REFIT_BACKEND}"
   policy.generation.mcore_generation_config.buffer_size_gb="${BUFFER_SIZE_GB}"
   policy.generation.mcore_generation_config.cuda_graph_impl="${MEGATRON_CUDA_GRAPH_IMPL}"
   policy.generation.mcore_generation_config.inference_cuda_graph_scope=block
@@ -320,6 +323,7 @@ COMMON_OVERRIDES=(
   ++async_rl.max_inflight_prompts="${MAX_INFLIGHT_PROMPTS}"
   ++async_rl.max_buffered_rollouts="${MAX_BUFFERED_ROLLOUTS}"
   ++async_rl.diagnostics="${ASYNC_RL_DIAGNOSTICS}"
+  ++async_rl.generation_fleet_health.refit_timeout_s=null
   checkpointing.enabled=false
   logger.log_dir="${RESULTS_DIR}"
   logger.wandb_enabled="${WANDB_ENABLED}"
@@ -331,7 +335,7 @@ COMMON_OVERRIDES=(
 
 echo "Launching NeMo-RL v2 Omni ${TASK}: ${TRAIN_GPUS} train + ${GEN_GPUS} generation GPUs"
 echo "  SingleController async sampler: in_order, max lookahead ${MAX_LOOKAHEAD_VERSIONS}"
-echo "  Megatron generation: TP=${INFER_TP} EP=${INFER_EP}, ${MEGATRON_TRANSFORMER_IMPL}, CG=${MEGATRON_CUDA_GRAPH_IMPL}, MoE padding=${MOE_PAD_EXPERTS_FOR_CG}, logging_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL}"
+echo "  Megatron generation: TP=${INFER_TP} EP=${INFER_EP}, refit=${REFIT_TRANSPORT}/${REFIT_BACKEND}, ${MEGATRON_TRANSFORMER_IMPL}, CG=${MEGATRON_CUDA_GRAPH_IMPL}, MoE padding=${MOE_PAD_EXPERTS_FOR_CG}, logging_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL}"
 echo "  GPU monitoring: enabled=${MONITOR_GPUS} collection=${GPU_MONITORING_COLLECTION_INTERVAL}s flush=${GPU_MONITORING_FLUSH_INTERVAL}s"
 
 exec env "${NSYS_ENV[@]}" uv run --no-sync python examples/run_grpo_single_controller.py \
