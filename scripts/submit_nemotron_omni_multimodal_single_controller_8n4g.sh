@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Eight-node/four-GPU NeMo-RL v2 SingleController launcher for Nemotron Omni.
 # The default non-colocated layout matches the NeMo-RL v1 parity launchers:
-# two training nodes and six Megatron generation nodes.
+# two training nodes and six generation nodes. Megatron inference remains the
+# default; set GENERATION_BACKEND=vllm for a SingleController vLLM A/B run.
 
 NEMORL="/lustre/fsw/portfolios/coreai/users/cye/code/RL"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
@@ -11,6 +12,7 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-${NEMORL}/workspace}"
 TASK="${TASK:-clevr}"
 COLOCATED="${COLOCATED:-false}"
 ASYNC_GRPO="${ASYNC_GRPO:-true}"
+GENERATION_BACKEND="${GENERATION_BACKEND:-megatron}"
 
 if [[ "${COLOCATED}" != "false" ]]; then
   echo "SingleController currently requires COLOCATED=false." >&2
@@ -18,6 +20,10 @@ if [[ "${COLOCATED}" != "false" ]]; then
 fi
 if [[ "${ASYNC_GRPO}" != "true" ]]; then
   echo "SingleController uses async_rl and currently requires ASYNC_GRPO=true." >&2
+  exit 1
+fi
+if [[ "${GENERATION_BACKEND}" != "megatron" && "${GENERATION_BACKEND}" != "vllm" ]]; then
+  echo "GENERATION_BACKEND must be megatron or vllm (got ${GENERATION_BACKEND})." >&2
   exit 1
 fi
 
@@ -59,8 +65,14 @@ if (( POLICY_CP > 1 )); then
 else
   MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY="${MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY:-${POLICY_TP}}"
 fi
-INFER_TP="${INFER_TP:-8}"
-INFER_EP="${INFER_EP:-8}"
+INFER_TP="${INFER_TP:-4}"
+INFER_EP="${INFER_EP:-4}"
+if [[ "${GENERATION_BACKEND}" == "vllm" && "${INFER_EP}" != "${INFER_TP}" ]]; then
+  # Async vLLM cannot use internal DP. EP=TP leaves replica-level DP to Ray,
+  # matching the Megatron inference replica count used by this launcher.
+  echo "Forcing INFER_EP=${INFER_TP} for vLLM (was ${INFER_EP}) for async-safe Ray DP." >&2
+  INFER_EP="${INFER_TP}"
+fi
 if (( POLICY_CP <= 0 ||
       TRAIN_WORLD_SIZE % (POLICY_TP * POLICY_CP) != 0 ||
       TRAIN_WORLD_SIZE % POLICY_EP != 0 )); then
@@ -157,6 +169,13 @@ PREFIX_CACHING_EVICTION_POLICY="${PREFIX_CACHING_EVICTION_POLICY:-lru}"
 PREFIX_CACHING_COORDINATOR_POLICY="${PREFIX_CACHING_COORDINATOR_POLICY:-longest_prefix}"
 MAMBA_INFERENCE_SSM_STATES_DTYPE="${MAMBA_INFERENCE_SSM_STATES_DTYPE:-float32}"
 OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-true}"
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
+VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
+VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
+VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-4}"
+VLLM_REFIT_TIMEOUT_S="${VLLM_REFIT_TIMEOUT_S:-300}"
+MOE_BACKEND="${MOE_BACKEND:-flashinfer_trtllm}"
+REFIT_ENV_EXPORTS=""
 if [[ "${MEGATRON_TRANSFORMER_IMPL}" != "inference_optimized" &&
       "${MEGATRON_CUDA_GRAPH_IMPL}" == "local" && "${INFER_EP}" -gt 1 ]]; then
   MOE_PAD_EXPERTS_FOR_CG="${MOE_PAD_EXPERTS_FOR_CG:-true}"
@@ -179,7 +198,11 @@ case "${TASK}" in
     VISION_EMBEDDING_CACHE_MAX_BYTES="${VISION_EMBEDDING_CACHE_MAX_BYTES:-536870912}"
     OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-true}"
     TASK_ENV="CLEVR_DATASET_MODE=config"
-    WANDB_NAME_SUFFIX="nrl_v2_sctq_image"
+    if [[ "${GENERATION_BACKEND}" == "megatron" ]]; then
+      WANDB_NAME_SUFFIX="nrl_v2_sctq_image"
+    else
+      WANDB_NAME_SUFFIX="nrl_v2_sctq_vllm_image"
+    fi
     TASK_OVERRIDES=""
     ;;
   vstat)
@@ -206,7 +229,11 @@ case "${TASK}" in
     OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-true}"
     ENABLE_THINKING="${ENABLE_THINKING:-true}"
     PREPARE_VSTAT="${PREPARE_VSTAT:-false}"
-    WANDB_NAME_SUFFIX="nrl_v2_sctq_video"
+    if [[ "${GENERATION_BACKEND}" == "megatron" ]]; then
+      WANDB_NAME_SUFFIX="nrl_v2_sctq_video"
+    else
+      WANDB_NAME_SUFFIX="nrl_v2_sctq_vllm_video"
+    fi
     TASK_VIDEO_EXPORTS="\
 export NRL_VIDEO_BACKEND=${NRL_VIDEO_BACKEND:-torchcodec}
 export NRL_VIDEO_SAMPLING_STYLE=${NRL_VIDEO_SAMPLING_STYLE:-nemotron_vl}
@@ -217,35 +244,35 @@ export NEMO_RL_VIDEO_VAL_JSONL=${NEMO_RL_VIDEO_VAL_JSONL}
 export NEMO_RL_VIDEO_MEDIA_ROOT=${NEMO_RL_VIDEO_MEDIA_ROOT}"
     TASK_ENV="DATA_ROOT=${DATA_ROOT} HF_DATASET=${HF_DATASET} NUM_DATA_ROWS=${NUM_DATA_ROWS} NUM_FRAMES=${NUM_FRAMES} TEMPORAL_PATCH_SIZE=${TEMPORAL_PATCH_SIZE} VIDEO_TARGET_PATCHES=${VIDEO_TARGET_PATCHES} MIN_GENERATION_TOKENS=${MIN_GENERATION_TOKENS} ENABLE_THINKING=${ENABLE_THINKING} PREPARE_VSTAT=${PREPARE_VSTAT}"
     TASK_OVERRIDES="\
-policy.tokenizer.chat_template_kwargs.enable_thinking=${ENABLE_THINKING} \
-policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST=\"'${TORCH_CUDA_ARCH_LIST:-10.0}'\" \
-policy.megatron_cfg.freeze_vision_model=false \
-policy.megatron_cfg.freeze_vision_projection=false \
-policy.megatron_cfg.freeze_moe_router=false \
-policy.megatron_cfg.mtp_num_layers=0 \
-policy.megatron_cfg.mtp_use_repeated_layer=true \
-policy.megatron_cfg.mtp_detach_heads=true \
-policy.megatron_cfg.mtp_loss_scaling_factor=0.0 \
-policy.megatron_cfg.pipeline_model_parallel_size=1 \
-policy.megatron_cfg.moe_shared_expert_overlap=false \
-policy.megatron_cfg.radio_force_cpe_eval_mode=true \
-policy.megatron_cfg.clear_memory_caches_before_refit=true \
-policy.megatron_cfg.optimizer.params_dtype=float32 \
-policy.generation.mcore_generation_config.parsers=[nemotron-v3-reasoning,qwen3-coder-tool] \
+++policy.tokenizer.chat_template_kwargs.enable_thinking=${ENABLE_THINKING} \
+++policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST=\"'${TORCH_CUDA_ARCH_LIST:-10.0}'\" \
+++policy.megatron_cfg.freeze_vision_model=false \
+++policy.megatron_cfg.freeze_vision_projection=false \
+++policy.megatron_cfg.freeze_moe_router=false \
+++policy.megatron_cfg.mtp_num_layers=0 \
+++policy.megatron_cfg.mtp_use_repeated_layer=true \
+++policy.megatron_cfg.mtp_detach_heads=true \
+++policy.megatron_cfg.mtp_loss_scaling_factor=0.0 \
+++policy.megatron_cfg.pipeline_model_parallel_size=1 \
+++policy.megatron_cfg.moe_shared_expert_overlap=false \
+++policy.megatron_cfg.radio_force_cpe_eval_mode=true \
+++policy.megatron_cfg.clear_memory_caches_before_refit=true \
+++policy.megatron_cfg.optimizer.params_dtype=float32 \
+++policy.generation.mcore_generation_config.parsers=[nemotron-v3-reasoning,qwen3-coder-tool] \
 ++policy.generation.mcore_generation_config.video_num_frames=${NUM_FRAMES} \
 ++policy.generation.mcore_generation_config.video_temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
 ++policy.generation.mcore_generation_config.video_target_num_patches=${VIDEO_TARGET_PATCHES} \
-data.max_input_seq_length=${MAX_SEQUENCE_LENGTH} \
+++data.max_input_seq_length=${MAX_SEQUENCE_LENGTH} \
 ++data.default.num_frames=${NUM_FRAMES} \
 ++data.default.video_sampling_style=nemotron_vl \
 ++data.default.video_temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
 ++data.default.min_generation_tokens=${MIN_GENERATION_TOKENS} \
 ++data.default.video_target_num_patches=${VIDEO_TARGET_PATCHES} \
-data.default.video_maintain_aspect_ratio=true \
-data.train.data_path=${NEMO_RL_VIDEO_TRAIN_JSONL} \
-data.validation.data_path=${NEMO_RL_VIDEO_VAL_JSONL} \
+++data.default.video_maintain_aspect_ratio=true \
+++data.train.data_path=${NEMO_RL_VIDEO_TRAIN_JSONL} \
+++data.validation.data_path=${NEMO_RL_VIDEO_VAL_JSONL} \
 ++env.nemo_gym.policy_model.responses_api_models.vllm_model.chat_template_kwargs.enable_thinking=${ENABLE_THINKING} \
-grpo.deduplicate_multimodal_data=false"
+++grpo.deduplicate_multimodal_data=false"
     ;;
   *)
     echo "TASK must be clevr or vstat (got ${TASK})." >&2
@@ -254,6 +281,103 @@ grpo.deduplicate_multimodal_data=false"
 esac
 
 INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-$((MAX_SEQUENCE_LENGTH < 4096 ? MAX_SEQUENCE_LENGTH : 4096))}"
+if [[ -z "${VLLM_MAX_NUM_BATCHED_TOKENS}" ]]; then
+  VLLM_MAX_NUM_BATCHED_TOKENS="${MAX_SEQUENCE_LENGTH}"
+fi
+if [[ "${GENERATION_BACKEND}" == "megatron" ]]; then
+  GENERATION_OVERRIDES="\
+++policy.generation.backend=megatron \
+++policy.generation.stop_strings=null \
+++policy.generation.bad_words=null \
+++policy.generation.colocated.enabled=false \
+++policy.generation.colocated.resources.num_nodes=${NUM_GEN_NODES} \
+++policy.generation.colocated.resources.gpus_per_node=${GEN_GPUS_PER_NODE} \
+++policy.generation.max_new_tokens=${MAX_NEW_TOKENS} \
+++policy.generation.mcore_generation_config.tensor_model_parallel_size=${INFER_TP} \
+++policy.generation.mcore_generation_config.expert_model_parallel_size=${INFER_EP} \
+++policy.generation.mcore_generation_config.expert_tensor_parallel_size=1 \
+++policy.generation.mcore_generation_config.context_parallel_size=1 \
+++policy.generation.mcore_generation_config.moe_router_dtype=fp32 \
+++policy.generation.mcore_generation_config.transformer_impl=${MEGATRON_TRANSFORMER_IMPL} \
+++policy.generation.mcore_generation_config.sequence_parallel=true \
+++policy.generation.mcore_generation_config.enable_chunked_prefill=${MEGATRON_ENABLE_CHUNKED_PREFILL} \
+++policy.generation.mcore_generation_config.enable_prefix_caching=${ENABLE_PREFIX_CACHING} \
+++policy.generation.mcore_generation_config.prefix_caching_mamba_gb=${PREFIX_CACHING_MAMBA_GB} \
+++policy.generation.mcore_generation_config.prefix_caching_eviction_policy=${PREFIX_CACHING_EVICTION_POLICY} \
+++policy.generation.mcore_generation_config.prefix_caching_coordinator_policy=${PREFIX_CACHING_COORDINATOR_POLICY} \
+++policy.generation.mcore_generation_config.vision_embedding_cache_max_bytes=${VISION_EMBEDDING_CACHE_MAX_BYTES} \
+++policy.generation.mcore_generation_config.cuda_graph_impl=${MEGATRON_CUDA_GRAPH_IMPL} \
+++policy.generation.mcore_generation_config.inference_cuda_graph_scope=${MEGATRON_CUDA_GRAPH_SCOPE} \
+++policy.generation.mcore_generation_config.num_cuda_graphs=${MEGATRON_NUM_CUDA_GRAPHS} \
+++policy.generation.mcore_generation_config.use_cuda_graphs_for_non_decode_steps=${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE} \
+++policy.generation.mcore_generation_config.logging_step_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL} \
+++policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference=${MOE_PAD_EXPERTS_FOR_CG} \
+++policy.generation.refit_transport=${REFIT_TRANSPORT} \
+++policy.generation.mcore_generation_config.refit_backend=${REFIT_BACKEND} \
+++policy.generation.mcore_generation_config.buffer_size_gb=${BUFFER_SIZE_GB} \
+++policy.generation.mcore_generation_config.kv_cache_management_mode=persist \
+++policy.generation.mcore_generation_config.async_sched_mode=async \
+++policy.generation.mcore_generation_config.logprobs_mode=raw_logprobs \
+++policy.generation.mcore_generation_config.mamba_inference_ssm_states_dtype=${MAMBA_INFERENCE_SSM_STATES_DTYPE} \
+++policy.generation.mcore_generation_config.mamba_inference_conv_states_dtype=float32 \
+++policy.generation.mcore_generation_config.max_model_len=${MAX_SEQUENCE_LENGTH} \
+++policy.generation.mcore_generation_config.max_tokens=${INFERENCE_MAX_TOKENS}"
+  REFIT_TIMEOUT_OVERRIDE="++async_rl.generation_fleet_health.refit_timeout_s=null"
+else
+  # Non-colocated vLLM refit packs weights into bounded NCCL chunks. Both
+  # producer and consumers must use the same ratio to agree on chunk boundaries.
+  REFIT_BUFFER_MEMORY_RATIO="${NRL_REFIT_BUFFER_MEMORY_RATIO:-0.005}"
+  REFIT_ENV_EXPORTS="export NRL_REFIT_BUFFER_MEMORY_RATIO=${REFIT_BUFFER_MEMORY_RATIO}"
+  GENERATION_OVERRIDES="\
+++policy.generation.backend=vllm \
+++policy.generation.refit_transport=null \
+++policy.generation.stop_strings=null \
+++policy.generation.bad_words=null \
+++policy.generation.colocated.enabled=false \
+++policy.generation.colocated.resources.num_nodes=${NUM_GEN_NODES} \
+++policy.generation.colocated.resources.gpus_per_node=${GEN_GPUS_PER_NODE} \
+++policy.generation.max_new_tokens=${MAX_NEW_TOKENS} \
+++policy.generation.vllm_cfg.async_engine=true \
+++policy.generation.vllm_cfg.skip_tokenizer_init=false \
+++policy.generation.vllm_cfg.tensor_parallel_size=${INFER_TP} \
+++policy.generation.vllm_cfg.pipeline_parallel_size=1 \
+++policy.generation.vllm_cfg.expert_parallel_size=${INFER_EP} \
+++policy.generation.vllm_cfg.max_model_len=${MAX_SEQUENCE_LENGTH} \
+++policy.generation.vllm_cfg.cap_max_tokens_to_context=true \
+++policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION} \
+++policy.generation.vllm_cfg.enforce_eager=${VLLM_ENFORCE_EAGER} \
+++policy.generation.vllm_cfg.enable_prefix_caching=true \
+++policy.generation.vllm_cfg.logprobs_mode=raw_logprobs \
+++policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update=false \
+++policy.generation.vllm_kwargs.limit_mm_per_prompt.image=1 \
+++policy.generation.vllm_kwargs.max_num_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS} \
+++policy.generation.vllm_kwargs.mamba_ssm_cache_dtype=float32 \
+++policy.generation.vllm_kwargs.skip_mm_profiling=true \
+++policy.generation.vllm_kwargs.kernel_config.enable_flashinfer_autotune=false \
+++policy.generation.vllm_kwargs.kernel_config.moe_backend=${MOE_BACKEND}"
+  if [[ "${TASK}" == "vstat" ]]; then
+    GENERATION_OVERRIDES+=" \
+++policy.generation.vllm_cfg.video.sampling_style=nemotron_vl \
+++policy.generation.vllm_cfg.video.num_frames=${NUM_FRAMES} \
+++policy.generation.vllm_cfg.video.temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
+++policy.generation.vllm_cfg.env_vars.NRL_VIDEO_BACKEND=torchcodec \
+++policy.generation.vllm_cfg.env_vars.NRL_VIDEO_SAMPLING_STYLE=nemotron_vl \
+++policy.generation.vllm_cfg.env_vars.NRL_VIDEO_TEMPORAL_PATCH_SIZE=${TEMPORAL_PATCH_SIZE} \
+++policy.generation.vllm_cfg.env_vars.VLLM_VIDEO_LOADER_BACKEND=nemotron_vl \
+++policy.generation.vllm_kwargs.allowed_local_media_path=${NEMO_RL_VIDEO_MEDIA_ROOT} \
+++policy.generation.vllm_kwargs.mm_processor_cache_gb=0 \
+++policy.generation.vllm_kwargs.max_num_seqs=${VLLM_MAX_NUM_SEQS} \
+++policy.generation.vllm_kwargs.limit_mm_per_prompt.video.count=1 \
+++policy.generation.vllm_kwargs.limit_mm_per_prompt.video.num_frames=${NUM_FRAMES} \
+++policy.generation.vllm_kwargs.enable_chunked_prefill=false \
+++policy.generation.vllm_kwargs.disable_custom_all_reduce=true \
+++policy.generation.vllm_kwargs.attention_backend=FLASH_ATTN \
+++policy.generation.vllm_kwargs.attention_config.use_trtllm_attention=false"
+  fi
+  # Unlike native MCore refit, vLLM's supervised workers can abort and restart
+  # after a failed collective, so retain a bounded health deadline.
+  REFIT_TIMEOUT_OVERRIDE="++async_rl.generation_fleet_health.refit_timeout_s=${VLLM_REFIT_TIMEOUT_S}"
+fi
 if (( TRAIN_GBS != NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT )); then
   echo "TRAIN_GBS must equal NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT." >&2
   exit 1
@@ -263,16 +387,23 @@ if (( INFERENCE_MAX_TOKENS <= 0 )); then
   exit 1
 fi
 
-RESULTS_DIR="${RESULTS_DIR:-${WORKSPACE_ROOT}/results/nemo-rl-v2-omni/${TASK}-8n4g}"
+if [[ "${GENERATION_BACKEND}" == "megatron" ]]; then
+  DEFAULT_RESULTS_DIR="${WORKSPACE_ROOT}/results/nemo-rl-v2-omni/${TASK}-8n4g"
+  DEFAULT_JOB_NAME="nemotron-omni-${TASK}-single-controller-8n4g"
+else
+  DEFAULT_RESULTS_DIR="${WORKSPACE_ROOT}/results/nemo-rl-v2-omni/${TASK}-vllm-8n4g"
+  DEFAULT_JOB_NAME="nemotron-omni-${TASK}-vllm-single-controller-8n4g"
+fi
+RESULTS_DIR="${RESULTS_DIR:-${DEFAULT_RESULTS_DIR}}"
 CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-false}"
-JOB_NAME="${JOB_NAME:-nemotron-omni-${TASK}-single-controller-8n4g}"
+JOB_NAME="${JOB_NAME:-${DEFAULT_JOB_NAME}}"
 EXP_NAME="${EXP_NAME:-${JOB_NAME}}"
 PRECISION_RECIPE="${PRECISION_RECIPE:-bf16}"
 WANDB_PROJ="${WANDB_PROJ:-mllm-rl-dev}"
 WANDB_GROUP="${WANDB_GROUP:-adlr}"
 WANDB_NAME="${WANDB_NAME:-${EXP_NAME}-${PRECISION_RECIPE}-${WANDB_NAME_SUFFIX}}"
-# CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
-CONTAINER="/scratch/fsw/portfolios/coreai/users/cye/enroot/nrl_gym_nightly_arm_20260910.sqsh"
+CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
+# CONTAINER="${CONTAINER:-/scratch/fsw/portfolios/coreai/users/cye/enroot/nrl_gym_nightly_arm_20260910.sqsh}"
 SBATCH_ACCOUNT="${SBATCH_ACCOUNT:-nemotron_sw_post}"
 SBATCH_PARTITION="${SBATCH_PARTITION:-batch_long}"
 SBATCH_QOS="${SBATCH_QOS:-}"
@@ -329,7 +460,11 @@ fi
 
 ENABLE_NSYS="${ENABLE_NSYS:-false}"
 if [[ "${ENABLE_NSYS}" == "true" ]]; then
-  export NRL_NSYS_WORKER_PATTERNS="${NRL_NSYS_WORKER_PATTERNS:-*policy*,*megatron*}"
+  if [[ "${GENERATION_BACKEND}" == "vllm" ]]; then
+    export NRL_NSYS_WORKER_PATTERNS="${NRL_NSYS_WORKER_PATTERNS:-*policy*,*megatron*,*vllm*}"
+  else
+    export NRL_NSYS_WORKER_PATTERNS="${NRL_NSYS_WORKER_PATTERNS:-*policy*,*megatron*}"
+  fi
   export NRL_NSYS_PROFILE_STEP_RANGE="${NRL_NSYS_PROFILE_STEP_RANGE:-2:5}"
   export LD_LIBRARY_PATH="/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/cuda/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib/aarch64-linux-gnu:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
   export NRL_NSYS_EXTRA_OPTIONS="${NRL_NSYS_EXTRA_OPTIONS:-}"
@@ -341,7 +476,31 @@ fi
 
 export SETUP_COMMAND=""
 if [[ "${TASK}" == "vstat" ]]; then
-  export SETUP_COMMAND="cd ${CONTAINER_NEMORL} && AUDIO_DEPS_STAGGER_MAX_S=${AUDIO_DEPS_STAGGER_MAX_S:-30} bash tools/install_audio_deps.sh"
+  if [[ "${GENERATION_BACKEND}" == "vllm" ]]; then
+    VLLM_WORKER_CLASS="nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+    VLLM_WORKER_PYTHON="${NEMO_RL_VENV_DIR}/${VLLM_WORKER_CLASS}/bin/python"
+    export SETUP_COMMAND="\
+set -euo pipefail
+cd ${CONTAINER_NEMORL}
+MEGATRON_WORKER_PYTHON=${NEMO_RL_VENV_DIR}/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
+if [[ ! -x \${MEGATRON_WORKER_PYTHON} ]]; then
+  FORCE_REBUILD_VENV=${NRL_FORCE_REBUILD_VENVS} uv run --no-sync python -c 'import os; from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES; from nemo_rl.utils.venvs import create_local_venv; create_local_venv(PY_EXECUTABLES.MCORE, \"nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker\", force_rebuild=os.environ[\"FORCE_REBUILD_VENV\"].lower() == \"true\")'
+fi
+AUDIO_DEPS_STAGGER_MAX_S=${AUDIO_DEPS_STAGGER_MAX_S:-30} RAY_MEGATRON_PYTHON=\${MEGATRON_WORKER_PYTHON} bash tools/install_audio_deps.sh
+if [[ ! -x ${VLLM_WORKER_PYTHON} ]]; then
+  FORCE_REBUILD_VENV=${NRL_FORCE_REBUILD_VENVS} VLLM_WORKER_CLASS=${VLLM_WORKER_CLASS} uv run --no-sync python -c 'import os; from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES; from nemo_rl.utils.venvs import create_local_venv; create_local_venv(PY_EXECUTABLES.VLLM_GYM, os.environ[\"VLLM_WORKER_CLASS\"], force_rebuild=os.environ[\"FORCE_REBUILD_VENV\"].lower() == \"true\")'
+fi
+${VLLM_WORKER_PYTHON} -c 'import torchcodec'"
+  else
+    export SETUP_COMMAND="\
+set -euo pipefail
+cd ${CONTAINER_NEMORL}
+MEGATRON_WORKER_PYTHON=${NEMO_RL_VENV_DIR}/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
+if [[ ! -x \${MEGATRON_WORKER_PYTHON} ]]; then
+  FORCE_REBUILD_VENV=${NRL_FORCE_REBUILD_VENVS} uv run --no-sync python -c 'import os; from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES; from nemo_rl.utils.venvs import create_local_venv; create_local_venv(PY_EXECUTABLES.MCORE, \"nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker\", force_rebuild=os.environ[\"FORCE_REBUILD_VENV\"].lower() == \"true\")'
+fi
+AUDIO_DEPS_STAGGER_MAX_S=${AUDIO_DEPS_STAGGER_MAX_S:-30} RAY_MEGATRON_PYTHON=\${MEGATRON_WORKER_PYTHON} bash tools/install_audio_deps.sh"
+  fi
 fi
 
 DRIVER_TASK_SETUP=""
@@ -402,88 +561,54 @@ export NVTE_FWD_LAYERNORM_SM_MARGIN=${NVTE_FWD_LAYERNORM_SM_MARGIN}
 export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN}
 export NCCL_DEBUG=${NCCL_DEBUG}
 ${TASK_VIDEO_EXPORTS}
+${REFIT_ENV_EXPORTS}
 BRIDGE=${CONTAINER_NEMORL}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
 export PYTHONPATH=${CONTAINER_NEMORL}:\${NEMO_GYM_EXTRA_ROOTS}:\${BRIDGE}/src:\${BRIDGE}/3rdparty/Megatron-LM\${PYTHONPATH:+:\${PYTHONPATH}}
 mkdir -p ${HF_HOME} ${NRL_MEGATRON_CHECKPOINT_DIR} ${RESULTS_DIR}
 ${DRIVER_TASK_SETUP}
 exec env ${TASK_ENV} uv run --no-sync python examples/run_grpo_single_controller.py \
 --config ${CONFIG} \
-policy.model_name=${MODEL_NAME} \
-policy.tokenizer.name=${MODEL_NAME} \
-policy.is_vlm=true \
-policy.max_total_sequence_length=${MAX_SEQUENCE_LENGTH} \
-policy.train_global_batch_size=${TRAIN_GBS} \
-policy.train_micro_batch_size=${TRAIN_MICRO_BATCH_SIZE} \
-policy.sequence_packing.enabled=true \
-cluster.num_nodes=${NUM_NODES} \
-cluster.gpus_per_node=${GPUS_PER_NODE} \
+++policy.model_name=${MODEL_NAME} \
+++policy.tokenizer.name=${MODEL_NAME} \
+++policy.is_vlm=true \
+++policy.max_total_sequence_length=${MAX_SEQUENCE_LENGTH} \
+++policy.train_global_batch_size=${TRAIN_GBS} \
+++policy.train_micro_batch_size=${TRAIN_MICRO_BATCH_SIZE} \
+++policy.sequence_packing.enabled=true \
+++cluster.num_nodes=${NUM_NODES} \
+++cluster.gpus_per_node=${GPUS_PER_NODE} \
 ++cluster.segment_size=${SEGMENT_SIZE} \
-policy.megatron_cfg.tensor_model_parallel_size=${POLICY_TP} \
-policy.megatron_cfg.expert_model_parallel_size=${POLICY_EP} \
-policy.megatron_cfg.expert_tensor_parallel_size=1 \
-policy.megatron_cfg.context_parallel_size=${POLICY_CP} \
-policy.make_sequence_length_divisible_by=${MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY} \
-policy.megatron_cfg.sequence_parallel=true \
-policy.megatron_cfg.bias_activation_fusion=false \
-policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=${OVERLAP_GRAD_REDUCE} \
-policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=${OVERLAP_PARAM_GATHER} \
-policy.megatron_cfg.optimizer.optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD} \
-policy.megatron_cfg.optimizer.optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION} \
-policy.megatron_cfg.optimizer.overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} \
+++policy.megatron_cfg.tensor_model_parallel_size=${POLICY_TP} \
+++policy.megatron_cfg.expert_model_parallel_size=${POLICY_EP} \
+++policy.megatron_cfg.expert_tensor_parallel_size=1 \
+++policy.megatron_cfg.context_parallel_size=${POLICY_CP} \
+++policy.make_sequence_length_divisible_by=${MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY} \
+++policy.megatron_cfg.sequence_parallel=true \
+++policy.megatron_cfg.bias_activation_fusion=false \
+++policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=${OVERLAP_GRAD_REDUCE} \
+++policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=${OVERLAP_PARAM_GATHER} \
+++policy.megatron_cfg.optimizer.optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD} \
+++policy.megatron_cfg.optimizer.optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION} \
+++policy.megatron_cfg.optimizer.overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} \
 ${OPTIMIZER_PRECISION_OVERRIDES} \
-policy.offload_optimizer_for_logprob=${OFFLOAD_OPTIMIZER_FOR_LOGPROB} \
-policy.generation.backend=megatron \
-++policy.generation.stop_strings=null \
-++policy.generation.bad_words=null \
-policy.generation.colocated.enabled=false \
-policy.generation.colocated.resources.num_nodes=${NUM_GEN_NODES} \
-policy.generation.colocated.resources.gpus_per_node=${GEN_GPUS_PER_NODE} \
-policy.generation.max_new_tokens=${MAX_NEW_TOKENS} \
-policy.generation.mcore_generation_config.tensor_model_parallel_size=${INFER_TP} \
-policy.generation.mcore_generation_config.expert_model_parallel_size=${INFER_EP} \
-++policy.generation.mcore_generation_config.expert_tensor_parallel_size=1 \
-++policy.generation.mcore_generation_config.context_parallel_size=1 \
-++policy.generation.mcore_generation_config.moe_router_dtype=fp32 \
-policy.generation.mcore_generation_config.transformer_impl=${MEGATRON_TRANSFORMER_IMPL} \
-policy.generation.mcore_generation_config.sequence_parallel=true \
-policy.generation.mcore_generation_config.enable_chunked_prefill=${MEGATRON_ENABLE_CHUNKED_PREFILL} \
-policy.generation.mcore_generation_config.enable_prefix_caching=${ENABLE_PREFIX_CACHING} \
-++policy.generation.mcore_generation_config.prefix_caching_mamba_gb=${PREFIX_CACHING_MAMBA_GB} \
-++policy.generation.mcore_generation_config.prefix_caching_eviction_policy=${PREFIX_CACHING_EVICTION_POLICY} \
-++policy.generation.mcore_generation_config.prefix_caching_coordinator_policy=${PREFIX_CACHING_COORDINATOR_POLICY} \
-++policy.generation.mcore_generation_config.vision_embedding_cache_max_bytes=${VISION_EMBEDDING_CACHE_MAX_BYTES} \
-policy.generation.mcore_generation_config.cuda_graph_impl=${MEGATRON_CUDA_GRAPH_IMPL} \
-policy.generation.mcore_generation_config.inference_cuda_graph_scope=${MEGATRON_CUDA_GRAPH_SCOPE} \
-policy.generation.mcore_generation_config.num_cuda_graphs=${MEGATRON_NUM_CUDA_GRAPHS} \
-policy.generation.mcore_generation_config.use_cuda_graphs_for_non_decode_steps=${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE} \
-++policy.generation.mcore_generation_config.logging_step_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL} \
-policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference=${MOE_PAD_EXPERTS_FOR_CG} \
-++policy.generation.refit_transport=${REFIT_TRANSPORT} \
-policy.generation.mcore_generation_config.refit_backend=${REFIT_BACKEND} \
-policy.generation.mcore_generation_config.buffer_size_gb=${BUFFER_SIZE_GB} \
-++policy.generation.mcore_generation_config.kv_cache_management_mode=persist \
-++policy.generation.mcore_generation_config.async_sched_mode=async \
-++policy.generation.mcore_generation_config.logprobs_mode=raw_logprobs \
-++policy.generation.mcore_generation_config.mamba_inference_ssm_states_dtype=${MAMBA_INFERENCE_SSM_STATES_DTYPE} \
-++policy.generation.mcore_generation_config.mamba_inference_conv_states_dtype=float32 \
-policy.generation.mcore_generation_config.max_model_len=${MAX_SEQUENCE_LENGTH} \
-policy.generation.mcore_generation_config.max_tokens=${INFERENCE_MAX_TOKENS} \
+++policy.offload_optimizer_for_logprob=${OFFLOAD_OPTIMIZER_FOR_LOGPROB} \
+${GENERATION_OVERRIDES} \
 ++data_plane.enabled=true \
 ++data_plane.impl=transfer_queue \
 ++data_plane.backend=simple \
 ++data_plane.claim_meta_poll_interval_s=0.5 \
 ++data_plane.simple.num_storage_units=${NUM_STORAGE_UNITS} \
-grpo.async_grpo=null \
-grpo.num_prompts_per_step=${NUM_PROMPTS_PER_STEP} \
-grpo.num_generations_per_prompt=${NUM_GENERATIONS_PER_PROMPT} \
-grpo.max_num_steps=${MAX_STEPS} \
-grpo.val_period=${VAL_PERIOD} \
-grpo.val_at_start=${VAL_AT_START} \
-grpo.val_at_end=${VAL_AT_END} \
-grpo.val_batch_size=${VAL_GBS} \
-grpo.max_val_samples=${VAL_SIZE} \
-grpo.overlong_filtering=false \
-loss_fn.use_importance_sampling_correction=true \
+++grpo.async_grpo=null \
+++grpo.num_prompts_per_step=${NUM_PROMPTS_PER_STEP} \
+++grpo.num_generations_per_prompt=${NUM_GENERATIONS_PER_PROMPT} \
+++grpo.max_num_steps=${MAX_STEPS} \
+++grpo.val_period=${VAL_PERIOD} \
+++grpo.val_at_start=${VAL_AT_START} \
+++grpo.val_at_end=${VAL_AT_END} \
+++grpo.val_batch_size=${VAL_GBS} \
+++grpo.max_val_samples=${VAL_SIZE} \
+++grpo.overlong_filtering=false \
+++loss_fn.use_importance_sampling_correction=true \
 ++async_rl.sampler.name=in_order \
 ++async_rl.sampler.max_lookahead_versions=${MAX_LOOKAHEAD_VERSIONS} \
 ++async_rl.recompute_kv_cache_after_weight_updates=false \
@@ -491,33 +616,38 @@ loss_fn.use_importance_sampling_correction=true \
 ++async_rl.max_inflight_prompts=${MAX_INFLIGHT_PROMPTS} \
 ++async_rl.max_buffered_rollouts=${MAX_BUFFERED_ROLLOUTS} \
 ++async_rl.diagnostics=${ASYNC_RL_DIAGNOSTICS} \
-++async_rl.generation_fleet_health.refit_timeout_s=null \
-checkpointing.enabled=${CHECKPOINTING_ENABLED} \
-checkpointing.checkpoint_dir=${RESULTS_DIR} \
-checkpointing.metric_name=null \
-logger.log_dir=${RESULTS_DIR} \
-logger.wandb_enabled=${WANDB_ENABLED} \
-logger.tensorboard_enabled=false \
-logger.monitor_gpus=${MONITOR_GPUS} \
-logger.gpu_monitoring.collection_interval=${GPU_MONITORING_COLLECTION_INTERVAL} \
-logger.gpu_monitoring.flush_interval=${GPU_MONITORING_FLUSH_INTERVAL} \
-logger.wandb.name=${WANDB_NAME}-\${NRL_SLURM_JOB_ID} \
-logger.wandb.project=${WANDB_PROJ} \
-+logger.wandb.entity=${WANDB_GROUP} \
+${REFIT_TIMEOUT_OVERRIDE} \
+++checkpointing.enabled=${CHECKPOINTING_ENABLED} \
+++checkpointing.checkpoint_dir=${RESULTS_DIR} \
+++checkpointing.metric_name=null \
+++logger.log_dir=${RESULTS_DIR} \
+++logger.wandb_enabled=${WANDB_ENABLED} \
+++logger.tensorboard_enabled=false \
+++logger.monitor_gpus=${MONITOR_GPUS} \
+++logger.gpu_monitoring.collection_interval=${GPU_MONITORING_COLLECTION_INTERVAL} \
+++logger.gpu_monitoring.flush_interval=${GPU_MONITORING_FLUSH_INTERVAL} \
+++logger.wandb.name=${WANDB_NAME}-\${NRL_SLURM_JOB_ID} \
+++logger.wandb.project=${WANDB_PROJ} \
+++logger.wandb.entity=${WANDB_GROUP} \
 ${TASK_OVERRIDES} \
 ${EXTRA_OVERRIDES}"
 
 echo "Submitting ${JOB_NAME}: ${NUM_NODES}x${GPUS_PER_NODE}"
 echo "  split: ${NUM_TRAIN_NODES} train nodes / ${NUM_GEN_NODES} generation nodes"
 echo "  train TP/EP/CP/world/DP: ${POLICY_TP}/${POLICY_EP}/${POLICY_CP}/${TRAIN_WORLD_SIZE}/${TRAIN_DP_SIZE}"
-echo "  generation TP/EP/world/DP: ${INFER_TP}/${INFER_EP}/${INFERENCE_WORLD_SIZE}/${INFERENCE_DP_SIZE}"
+echo "  generation backend/TP/EP/world/DP: ${GENERATION_BACKEND}/${INFER_TP}/${INFER_EP}/${INFERENCE_WORLD_SIZE}/${INFERENCE_DP_SIZE}"
 echo "  max model parallel GPUs / segment nodes: ${MAX_MODEL_PARALLEL_SIZE}/${SEGMENT_SIZE}"
 echo "  prompts/generations/train_gbs: ${NUM_PROMPTS_PER_STEP}/${NUM_GENERATIONS_PER_PROMPT}/${TRAIN_GBS}"
 echo "  async sampler/lookahead/inflight/buffer: in_order/${MAX_LOOKAHEAD_VERSIONS}/${MAX_INFLIGHT_PROMPTS}/${MAX_BUFFERED_ROLLOUTS}"
 echo "  sequence/inference-step/new tokens: ${MAX_SEQUENCE_LENGTH}/${INFERENCE_MAX_TOKENS}/${MAX_NEW_TOKENS}"
-echo "  generation: colocated=${COLOCATED} async=${ASYNC_GRPO} refit=${REFIT_TRANSPORT}/${REFIT_BACKEND}"
-echo "  Megatron: transformer=${MEGATRON_TRANSFORMER_IMPL} chunked_prefill=${MEGATRON_ENABLE_CHUNKED_PREFILL} prefix_caching=${ENABLE_PREFIX_CACHING} logging_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL}"
-echo "  CUDA graphs: impl=${MEGATRON_CUDA_GRAPH_IMPL} scope=${MEGATRON_CUDA_GRAPH_SCOPE} count=${MEGATRON_NUM_CUDA_GRAPHS} non_decode=${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE} moe_padding=${MOE_PAD_EXPERTS_FOR_CG}"
+if [[ "${GENERATION_BACKEND}" == "megatron" ]]; then
+  echo "  generation: colocated=${COLOCATED} async=${ASYNC_GRPO} refit=${REFIT_TRANSPORT}/${REFIT_BACKEND}"
+  echo "  Megatron: transformer=${MEGATRON_TRANSFORMER_IMPL} chunked_prefill=${MEGATRON_ENABLE_CHUNKED_PREFILL} prefix_caching=${ENABLE_PREFIX_CACHING} logging_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL}"
+  echo "  CUDA graphs: impl=${MEGATRON_CUDA_GRAPH_IMPL} scope=${MEGATRON_CUDA_GRAPH_SCOPE} count=${MEGATRON_NUM_CUDA_GRAPHS} non_decode=${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE} moe_padding=${MOE_PAD_EXPERTS_FOR_CG}"
+else
+  echo "  generation: colocated=${COLOCATED} async=${ASYNC_GRPO} refit=nccl-packed ratio=${REFIT_BUFFER_MEMORY_RATIO} timeout=${VLLM_REFIT_TIMEOUT_S}s"
+  echo "  vLLM: mem_util=${VLLM_GPU_MEMORY_UTILIZATION} eager=${VLLM_ENFORCE_EAGER} max_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS}"
+fi
 echo "  optimizer: cpu_offload=${OPTIMIZER_CPU_OFFLOAD} offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION} overlap_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} logprob_offload=${OFFLOAD_OPTIMIZER_FOR_LOGPROB}"
 echo "  config: ${CONFIG}"
 if [[ "${TASK}" == "vstat" ]]; then
