@@ -343,7 +343,7 @@ fi
 
 export SETUP_COMMAND=""
 if [[ "${TASK}" == "vstat" ]]; then
-  export SETUP_COMMAND="cd ${CONTAINER_NEMORL} && bash tools/install_audio_deps.sh"
+  export SETUP_COMMAND="cd ${CONTAINER_NEMORL} && AUDIO_DEPS_STAGGER_MAX_S=${AUDIO_DEPS_STAGGER_MAX_S:-30} bash tools/install_audio_deps.sh"
 fi
 
 DRIVER_TASK_SETUP=""
