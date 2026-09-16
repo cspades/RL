@@ -1,0 +1,122 @@
+# Final Super 3.5 VL video-teacher recipe, preserving the validated settings from:
+# https://wandb.ai/adlr/Nemotron-omni-RL-debug/runs/mtpenalty223151
+#
+# All training settings that were command-line overrides in the reference run
+# are deliberately recorded here. The matching launcher passes only --config;
+# environment interpolation below is limited to run identity and filesystem
+# locations.
+defaults: ./vlm_grpo_videoqa_super_sav_caprl_derisk.v1.yaml
+
+cluster:
+  num_nodes: 32
+  gpus_per_node: 4
+  segment_size: 8
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  max_num_steps: 1000000
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+    recompute_kv_cache_after_weight_updates: false
+  length_penalty:
+    default:
+      enabled: true
+      length_type: tokens
+      profile_band_total: false
+      profile_band_reasoning: true
+      profile_band_answer: false
+    profile_band:
+      enabled: true
+      defaults:
+        reasoning:
+          a: 1024
+          b: 4096
+          f: 0.95
+  malformed_thinking_advantage: -5.0
+
+reward_penalties:
+  penalize_malformed_think_tag: true
+
+policy:
+  model_name: ${oc.env:VIDEO_TEACHER_MODEL_PATH,/lustre/fsw/portfolios/llmservice/users/jiaqiz/launch_scripts_super_v35/eval/conversion/converted_ckpt/grpo_superv3_5_rlvr_v43_broad_falcon_r3-oci-hsg-20260905-r1/step_120/hf}
+  train_global_batch_size: 2048
+  max_total_sequence_length: 65536
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: default
+    chat_template_kwargs:
+      enable_thinking: true
+      truncate_history_thinking: false
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 49152
+    logprob_mb_tokens: 65536
+    fuse_loss: true
+  router_replay:
+    enabled: true
+    transport: ray
+  megatron_cfg:
+    mtp_num_layers: 0
+    freeze_moe_router: true
+    moe_router_load_balancing_type: none
+    moe_router_bias_update_rate: 0.0
+    optimizer:
+      lr: 3.0e-6
+      min_lr: 2.0e-9
+      adam_beta2: 0.99
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-8
+      lr_decay_iters: 100000
+      lr_decay_style: constant
+  generation:
+    max_new_tokens: 16384
+    temperature: 1.0
+    top_p: 1.0
+    vllm_cfg:
+      max_model_len: 65536
+      http_server_serving_chat_kwargs:
+        chat_template: null
+        chat_template_content_format: openai
+        reasoning_parser: deepseek_r1
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 16
+        gpus_per_node: 4
+
+data:
+  max_input_seq_length: 65536
+  train:
+    data_path: ${oc.env:VIDEO_TEACHER_DATA_PATH,/lustre/fs1/portfolios/nemotron/projects/nemotron_omni_vision/users/ehosseiniasl/github_repos/nemorl/run_artifacts/data/train_sav_all_tracks_plus_caprl_exclude6215_hsg_mediafixed_9.jsonl}
+  validation:
+    data_path: ${data.train.data_path}
+
+env:
+  nemo_gym:
+    policy_max_input_tokens: 65536
+    uv_venv_dir: ${oc.env:VIDEO_TEACHER_GYM_VENV_DIR}
+    skip_venv_if_present: true
+
+checkpointing:
+  checkpoint_dir: ${oc.env:VIDEO_TEACHER_RESULTS_DIR}/checkpoints
+  load_replay_buffer: false
+  save_period: 5
+  keep_top_k: null
+
+logger:
+  log_dir: ${oc.env:VIDEO_TEACHER_RESULTS_DIR}/logs
+  wandb_enabled: true
+  wandb:
+    project: ${oc.env:VIDEO_TEACHER_WANDB_PROJECT,Nemotron-omni-RL-debug}
+    entity: adlr
+    name: ${oc.env:VIDEO_TEACHER_WANDB_NAME}
+    id: ${oc.env:VIDEO_TEACHER_WANDB_ID}
+    resume: allow
+    tags:
+      - oci-hsg-cs-001
