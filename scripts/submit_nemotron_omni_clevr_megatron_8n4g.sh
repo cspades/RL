@@ -8,19 +8,21 @@ set -euo pipefail
 # supported on this branch (NVIDIA-NeMo/RL#2884); set COLOCATED=true to share
 # all GPUs for train+gen. ASYNC_GRPO=true is required for colocated async.
 #
-# GENERATION_BACKEND=vllm flips inference to Omni vLLM for A/B vs Megatron.
+# vLLM is the default for V1 A/B runs. Set GENERATION_BACKEND=megatron to use
+# Megatron generation instead.
 # The A/B defaults disable stop/bad-word filters; native multimodal inputs are
 # supported by both synchronous and non-colocated asynchronous rollouts.
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
+NEMORL="$(cd "${NEMORL}" && pwd -P)"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-${NEMORL}/workspace}"
 
-CONTAINER="${CONTAINER:-/lustre/fsw/portfolios/coreai/users/cye/enroot/nemo-rl-nightly-gym.sqsh}"
+CONTAINER="${CONTAINER:-/scratch/fsw/portfolios/coreai/users/cye/enroot/nrl_gym_nightly_arm_20260910.sqsh}"
 MODEL_NAME="${MODEL_NAME:-nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}"
 CONFIG="${CONFIG:-examples/configs/recipes/vlm/vlm_grpo-nemotron-omni-30ba3b-clevr-8n4g-megatron_generation.v1.yaml}"
-GENERATION_BACKEND="${GENERATION_BACKEND:-megatron}"
+GENERATION_BACKEND="${GENERATION_BACKEND:-vllm}"
 COLOCATED="${COLOCATED:-false}"
 ASYNC_GRPO="${ASYNC_GRPO:-true}"
 
@@ -96,6 +98,11 @@ done
 POLICY_TP="${POLICY_TP:-${DEFAULT_POLICY_TP}}"
 INFER_TP="${INFER_TP:-${DEFAULT_INFER_TP}}"
 POLICY_CP="${POLICY_CP:-1}"
+if (( POLICY_CP > 1 )); then
+  MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY="${MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY:-$((POLICY_TP * POLICY_CP * 2))}"
+else
+  MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY="${MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY:-${POLICY_TP}}"
+fi
 
 if [[ "${GENERATION_BACKEND}" == "megatron" && "${POLICY_CP}" != "1" ]]; then
   echo "Megatron dynamic inference requires POLICY_CP=1." >&2
@@ -142,12 +149,13 @@ fi
 
 MAX_STEPS="${MAX_STEPS:-1000000}"
 MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-4096}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 # Two prompt groups per inference DP replica (non-colocated default: 6 gen
 # nodes → DP=3 → prompts=6; colocated 8n4g → DP=4 → prompts=8).
 NUM_PROMPTS="${NUM_PROMPTS:-$((INFERENCE_DP_SIZE * 2))}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
 TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS * NUM_GENERATIONS))}"
+TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-1}"
 EXPECTED_TRAIN_GBS=$((NUM_PROMPTS * NUM_GENERATIONS))
 VAL_GBS="${VAL_GBS:-64}"
 VAL_SIZE="${VAL_SIZE:-64}"
@@ -159,6 +167,10 @@ if (( TRAIN_GBS % TRAIN_DP_SIZE != 0 )); then
   echo "TRAIN_GBS (${TRAIN_GBS}) must be divisible by training DP size (${TRAIN_DP_SIZE})." >&2
   exit 1
 fi
+if (( TRAIN_MICRO_BATCH_SIZE <= 0 )); then
+  echo "TRAIN_MICRO_BATCH_SIZE must be positive." >&2
+  exit 1
+fi
 if (( VAL_GBS % TRAIN_DP_SIZE != 0 )); then
   echo "VAL_GBS (${VAL_GBS}) must be divisible by training DP size (${TRAIN_DP_SIZE})." >&2
   exit 1
@@ -167,6 +179,11 @@ REFIT_BACKEND="${REFIT_BACKEND:-nccl}"
 OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-false}"
 BUFFER_SIZE_GB="${BUFFER_SIZE_GB:-8}"
 OFFLOAD_OPTIMIZER_FOR_LOGPROB="${OFFLOAD_OPTIMIZER_FOR_LOGPROB:-false}"
+# V1 multimodal training can leave parameters unused in a batch. MCore's
+# overlapped grad-reduce warmup requires every bucket parameter to produce a
+# grad-ready hook, so keep this disabled unless the model graph is static.
+OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-false}"
+OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-true}"
 if [[ "${OPTIMIZER_CPU_OFFLOAD}" == "true" ]]; then
   OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
 else
@@ -176,6 +193,7 @@ fi
 EXP_AVG_DTYPE="${EXP_AVG_DTYPE:-bfloat16}"
 EXP_AVG_SQ_DTYPE="${EXP_AVG_SQ_DTYPE:-bfloat16}"
 STORE_PARAM_REMAINDERS="${STORE_PARAM_REMAINDERS:-true}"
+USE_PRECISION_AWARE_OPTIMIZER="${USE_PRECISION_AWARE_OPTIMIZER:-true}"
 # Megatron defaults for stable inference/training parity.
 MEGATRON_ENABLE_CHUNKED_PREFILL="${MEGATRON_ENABLE_CHUNKED_PREFILL:-true}"
 MEGATRON_TRANSFORMER_IMPL="${MEGATRON_TRANSFORMER_IMPL:-inference_optimized}"
@@ -184,6 +202,11 @@ MEGATRON_CUDA_GRAPH_SCOPE="${MEGATRON_CUDA_GRAPH_SCOPE:-block}"
 MEGATRON_NUM_CUDA_GRAPHS="${MEGATRON_NUM_CUDA_GRAPHS:--1}"
 MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE="${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE:-false}"
 MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL="${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL:-100}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
+PREFIX_CACHING_MAMBA_GB="${PREFIX_CACHING_MAMBA_GB:-20}"
+PREFIX_CACHING_EVICTION_POLICY="${PREFIX_CACHING_EVICTION_POLICY:-lru}"
+PREFIX_CACHING_COORDINATOR_POLICY="${PREFIX_CACHING_COORDINATOR_POLICY:-longest_prefix}"
+VISION_EMBEDDING_CACHE_MAX_BYTES="${VISION_EMBEDDING_CACHE_MAX_BYTES:-536870912}"
 if [[ "${MEGATRON_TRANSFORMER_IMPL}" != "inference_optimized" &&
       "${MEGATRON_CUDA_GRAPH_IMPL}" == "local" && "${INFER_EP}" -gt 1 ]]; then
   MOE_PAD_EXPERTS_FOR_CG="${MOE_PAD_EXPERTS_FOR_CG:-true}"
@@ -193,14 +216,18 @@ fi
 EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
 MAX_TRAJECTORY_AGE_STEPS="${MAX_TRAJECTORY_AGE_STEPS:-2}"
 IN_FLIGHT_WEIGHT_UPDATES="${IN_FLIGHT_WEIGHT_UPDATES:-true}"
+INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-$((MAX_SEQUENCE_LENGTH < 4096 ? MAX_SEQUENCE_LENGTH : 4096))}"
 
 JOB_NAME="${JOB_NAME:-nemotron-omni-clevr-${GENERATION_BACKEND}-8n4g}"
 EXP_NAME="${EXP_NAME:-${JOB_NAME}}"
 PRECISION_RECIPE="${PRECISION_RECIPE:-bf16}"
 WANDB_ENABLED="${WANDB_ENABLED:-true}"
+MONITOR_GPUS="${MONITOR_GPUS:-${WANDB_ENABLED}}"
+GPU_MONITORING_COLLECTION_INTERVAL="${GPU_MONITORING_COLLECTION_INTERVAL:-10}"
+GPU_MONITORING_FLUSH_INTERVAL="${GPU_MONITORING_FLUSH_INTERVAL:-10}"
 WANDB_PROJ="${WANDB_PROJ:-mllm-rl-dev}"
 WANDB_GROUP="${WANDB_GROUP:-adlr}"
-WANDB_NAME="${WANDB_NAME:-${EXP_NAME}-${PRECISION_RECIPE}-internal-repo}"
+WANDB_NAME="${WANDB_NAME:-${EXP_NAME}-${PRECISION_RECIPE}-nrl_v1_image}"
 RESULTS_DIR="${RESULTS_DIR:-${WORKSPACE_ROOT}/results/nemo-rl-omni/${JOB_NAME}}"
 CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-false}"
 SLURM_LOG_DIR="${SLURM_LOG_DIR:-${RESULTS_DIR}/slurm}"
@@ -212,7 +239,23 @@ SBATCH_PARTITION="${SBATCH_PARTITION:-batch_long}"
 SBATCH_QOS="${SBATCH_QOS:-}"
 SBATCH_TIME="${SBATCH_TIME:-04:00:00}"
 SBATCH_RESERVATION="${SBATCH_RESERVATION:-}"
-SBATCH_SEGMENT="${NUM_NODES}"
+MAX_MODEL_PARALLEL_SIZE=$((POLICY_TP * POLICY_CP))
+if (( POLICY_EP > MAX_MODEL_PARALLEL_SIZE )); then
+  MAX_MODEL_PARALLEL_SIZE=${POLICY_EP}
+fi
+if (( INFER_TP > MAX_MODEL_PARALLEL_SIZE )); then
+  MAX_MODEL_PARALLEL_SIZE=${INFER_TP}
+fi
+SEGMENT_SIZE="${SEGMENT_SIZE:-$(((MAX_MODEL_PARALLEL_SIZE + GPUS_PER_NODE - 1) / GPUS_PER_NODE))}"
+if (( SEGMENT_SIZE <= 0 || NUM_NODES % SEGMENT_SIZE != 0 )); then
+  echo "SEGMENT_SIZE ${SEGMENT_SIZE} must be positive and divide NUM_NODES ${NUM_NODES}." >&2
+  exit 1
+fi
+if [[ "${COLOCATED_ENABLED}" == "false" ]] && (( NUM_NODES > 1 )) &&
+   (( (NUM_NODES - NUM_GEN_NODES) % SEGMENT_SIZE != 0 )); then
+  echo "SEGMENT_SIZE ${SEGMENT_SIZE} must divide the non-colocated training-node count." >&2
+  exit 1
+fi
 
 mkdir -p \
   "${HF_HUB_CACHE}" \
@@ -229,8 +272,9 @@ if [[ ! -f "${CONTAINER}" ]]; then
   echo "Container image does not exist: ${CONTAINER}" >&2
   exit 1
 fi
-if [[ ! -f "${NEMORL}/ray.sub" || ! -f "${NEMORL}/${CONFIG}" ]]; then
-  echo "NeMo-RL launcher or config is missing under: ${NEMORL}" >&2
+if [[ ! -f "${NEMORL}/ray.sub" || ! -f "${NEMORL}/${CONFIG}" ||
+      ! -f "${NEMORL}/examples/run_vlm_grpo.py" ]]; then
+  echo "NeMo-RL launcher, config, or V1 entrypoint is missing under: ${NEMORL}" >&2
   exit 1
 fi
 
@@ -250,6 +294,7 @@ REFIT_BUFFER_MEMORY_RATIO=""
 
 if [[ "${GENERATION_BACKEND}" == "megatron" ]]; then
   GEN_OVERRIDES="\
+++policy.generation.refit_transport=mcore \
 ++policy.generation.stop_strings=null \
 ++policy.generation.bad_words=null \
 policy.generation.mcore_generation_config.tensor_model_parallel_size=${INFER_TP} \
@@ -263,6 +308,11 @@ policy.generation.mcore_generation_config.sequence_parallel=true \
 ++policy.generation.mcore_generation_config.mamba_inference_conv_states_dtype=float32 \
 ++policy.generation.mcore_generation_config.logprobs_mode=raw_logprobs \
 policy.generation.mcore_generation_config.enable_chunked_prefill=${MEGATRON_ENABLE_CHUNKED_PREFILL} \
+++policy.generation.mcore_generation_config.enable_prefix_caching=${ENABLE_PREFIX_CACHING} \
+++policy.generation.mcore_generation_config.prefix_caching_mamba_gb=${PREFIX_CACHING_MAMBA_GB} \
+++policy.generation.mcore_generation_config.prefix_caching_eviction_policy=${PREFIX_CACHING_EVICTION_POLICY} \
+++policy.generation.mcore_generation_config.prefix_caching_coordinator_policy=${PREFIX_CACHING_COORDINATOR_POLICY} \
+++policy.generation.mcore_generation_config.vision_embedding_cache_max_bytes=${VISION_EMBEDDING_CACHE_MAX_BYTES} \
 ++policy.generation.mcore_generation_config.async_sched_mode=async \
 policy.generation.mcore_generation_config.cuda_graph_impl=${MEGATRON_CUDA_GRAPH_IMPL} \
 policy.generation.mcore_generation_config.inference_cuda_graph_scope=${MEGATRON_CUDA_GRAPH_SCOPE} \
@@ -271,9 +321,10 @@ policy.generation.mcore_generation_config.use_cuda_graphs_for_non_decode_steps=$
 ++policy.generation.mcore_generation_config.logging_step_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL} \
 policy.generation.mcore_generation_config.refit_backend=${REFIT_BACKEND} \
 policy.generation.mcore_generation_config.buffer_size_gb=${BUFFER_SIZE_GB} \
+++policy.generation.mcore_generation_config.kv_cache_management_mode=persist \
 policy.generation.mcore_generation_config.moe_pad_experts_for_cuda_graph_inference=${MOE_PAD_EXPERTS_FOR_CG} \
 policy.generation.mcore_generation_config.max_model_len=${MAX_SEQUENCE_LENGTH} \
-policy.generation.mcore_generation_config.max_tokens=${MAX_SEQUENCE_LENGTH}"
+policy.generation.mcore_generation_config.max_tokens=${INFERENCE_MAX_TOKENS}"
 else
   # Non-colocated refit NCCL-broadcasts weights in packed chunks sized at
   # NRL_REFIT_BUFFER_MEMORY_RATIO * total HBM (the 0.02 default is 3.7GiB on
@@ -289,6 +340,7 @@ else
   # Per-step forward-pass token budget; mirrors mcore_generation_config.max_tokens.
   VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-${MAX_SEQUENCE_LENGTH}}"
   GEN_OVERRIDES="\
+++policy.generation.refit_transport=null \
 ++policy.generation.stop_strings=null \
 ++policy.generation.bad_words=null \
 policy.generation.vllm_cfg.async_engine=${ASYNC_GRPO} \
@@ -321,6 +373,18 @@ export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-16}"
 export NVTE_BWD_LAYERNORM_SM_MARGIN="${NVTE_BWD_LAYERNORM_SM_MARGIN:-16}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
+ENABLE_NSYS="${ENABLE_NSYS:-false}"
+if [[ "${ENABLE_NSYS}" == "true" ]]; then
+  export NRL_NSYS_WORKER_PATTERNS="${NRL_NSYS_WORKER_PATTERNS:-*policy*,*megatron*,*vllm*}"
+  export NRL_NSYS_PROFILE_STEP_RANGE="${NRL_NSYS_PROFILE_STEP_RANGE:-2:5}"
+  export LD_LIBRARY_PATH="/usr/local/cuda/targets/aarch64-linux/lib:/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/cuda/lib:/usr/local/nvidia/lib64:/usr/local/nvidia/lib:/usr/lib/aarch64-linux-gnu:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+  export NRL_NSYS_EXTRA_OPTIONS="${NRL_NSYS_EXTRA_OPTIONS:-}"
+else
+  unset NRL_NSYS_WORKER_PATTERNS
+  unset NRL_NSYS_PROFILE_STEP_RANGE
+  unset NRL_NSYS_EXTRA_OPTIONS
+fi
+
 BRIDGE="${CONTAINER_NEMORL}/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge"
 export COMMAND="\
 set -euo pipefail
@@ -337,11 +401,27 @@ export NRL_MEGATRON_CHECKPOINT_DIR=${NRL_MEGATRON_CHECKPOINT_DIR}
 export XDG_CACHE_HOME=${XDG_CACHE_HOME}
 export TORCH_HOME=${TORCH_HOME}
 export TRITON_CACHE_DIR=${TRITON_CACHE_DIR}
+export NEMO_RL_VENV_DIR=${NEMO_RL_VENV_DIR}
+export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-10.0}
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS}
+export FLASHINFER_DISABLE_VERSION_CHECK=${FLASHINFER_DISABLE_VERSION_CHECK}
+export NVTE_FWD_LAYERNORM_SM_MARGIN=${NVTE_FWD_LAYERNORM_SM_MARGIN}
+export NVTE_BWD_LAYERNORM_SM_MARGIN=${NVTE_BWD_LAYERNORM_SM_MARGIN}
+export NCCL_DEBUG=${NCCL_DEBUG}
 ${REFIT_ENV_EXPORTS}
+if [[ -n \"\${NRL_NSYS_WORKER_PATTERNS:-}\" ]]; then
+  NSYS_OUTPUT_DIR=${CONTAINER_NEMORL}/workspace/nsys/\${NRL_SLURM_JOB_ID}
+  mkdir -p \"\${NSYS_OUTPUT_DIR}\"
+  if [[ -z \"\${NRL_NSYS_EXTRA_OPTIONS:-}\" ]]; then
+    printf -v NRL_NSYS_EXTRA_OPTIONS '{\"o\":\"%s/%%p\",\"cpuctxsw\":\"none\",\"force-overwrite\":\"true\"}' \"\${NSYS_OUTPUT_DIR}\"
+    export NRL_NSYS_EXTRA_OPTIONS
+  fi
+fi
 export PYTHONPATH=${CONTAINER_NEMORL}:${BRIDGE}/src:${BRIDGE}/3rdparty/Megatron-LM\${PYTHONPATH:+:\$PYTHONPATH}
 uv run --no-sync python examples/run_vlm_grpo.py --config ${CONFIG} \
 cluster.num_nodes=${NUM_NODES} \
 cluster.gpus_per_node=${GPUS_PER_NODE} \
+++cluster.segment_size=${SEGMENT_SIZE} \
 policy.model_name=${MODEL_NAME} \
 policy.tokenizer.name=${MODEL_NAME} \
 policy.is_vlm=true \
@@ -349,9 +429,17 @@ policy.megatron_cfg.tensor_model_parallel_size=${POLICY_TP} \
 policy.megatron_cfg.expert_model_parallel_size=${POLICY_EP} \
 policy.megatron_cfg.expert_tensor_parallel_size=1 \
 policy.megatron_cfg.context_parallel_size=${POLICY_CP} \
+policy.make_sequence_length_divisible_by=${MAKE_SEQUENCE_LENGTH_DIVISIBLE_BY} \
+policy.megatron_cfg.sequence_parallel=true \
+policy.megatron_cfg.bias_activation_fusion=false \
+policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=${OVERLAP_GRAD_REDUCE} \
+policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=${OVERLAP_PARAM_GATHER} \
 policy.megatron_cfg.optimizer.optimizer_cpu_offload=${OPTIMIZER_CPU_OFFLOAD} \
 policy.megatron_cfg.optimizer.optimizer_offload_fraction=${OPTIMIZER_OFFLOAD_FRACTION} \
+policy.megatron_cfg.optimizer.use_precision_aware_optimizer=${USE_PRECISION_AWARE_OPTIMIZER} \
 policy.offload_optimizer_for_logprob=${OFFLOAD_OPTIMIZER_FOR_LOGPROB} \
+policy.train_micro_batch_size=${TRAIN_MICRO_BATCH_SIZE} \
+policy.sequence_packing.enabled=true \
 ${OPTIMIZER_DTYPE_OVERRIDES} \
 policy.generation.backend=${GENERATION_BACKEND} \
 policy.generation.colocated.enabled=${COLOCATED_ENABLED} \
@@ -366,6 +454,7 @@ grpo.async_grpo.in_flight_weight_updates=${IN_FLIGHT_WEIGHT_UPDATES} \
 loss_fn.use_importance_sampling_correction=true \
 grpo.num_prompts_per_step=${NUM_PROMPTS} \
 grpo.num_generations_per_prompt=${NUM_GENERATIONS} \
+grpo.overlong_filtering=false \
 grpo.val_batch_size=${VAL_GBS} \
 grpo.max_val_samples=${VAL_SIZE} \
 policy.train_global_batch_size=${TRAIN_GBS} \
@@ -374,6 +463,10 @@ checkpointing.enabled=${CHECKPOINTING_ENABLED} \
 checkpointing.checkpoint_dir=${RESULTS_DIR} \
 logger.log_dir=${RESULTS_DIR} \
 logger.wandb_enabled=${WANDB_ENABLED} \
+logger.tensorboard_enabled=false \
+logger.monitor_gpus=${MONITOR_GPUS} \
+logger.gpu_monitoring.collection_interval=${GPU_MONITORING_COLLECTION_INTERVAL} \
+logger.gpu_monitoring.flush_interval=${GPU_MONITORING_FLUSH_INTERVAL} \
 logger.wandb.name=${WANDB_NAME}-\${NRL_SLURM_JOB_ID} \
 logger.wandb.project=${WANDB_PROJ} \
 +logger.wandb.entity=${WANDB_GROUP} \
@@ -401,7 +494,9 @@ echo "  seq/new_tokens: ${MAX_SEQUENCE_LENGTH}/${MAX_NEW_TOKENS}"
 echo "  prompts/generations/train_gbs: ${NUM_PROMPTS}/${NUM_GENERATIONS}/${TRAIN_GBS}"
 echo "  async: max_trajectory_age=${MAX_TRAJECTORY_AGE_STEPS} in_flight_weight_updates=${IN_FLIGHT_WEIGHT_UPDATES}"
 echo "  val_gbs/val_size: ${VAL_GBS}/${VAL_SIZE}"
+echo "  optimizer: precision_aware=${USE_PRECISION_AWARE_OPTIMIZER} overlap_grad_reduce=${OVERLAP_GRAD_REDUCE} overlap_param_gather=${OVERLAP_PARAM_GATHER}"
 echo "  optimizer moments: exp_avg=${EXP_AVG_DTYPE:-<unset>} exp_avg_sq=${EXP_AVG_SQ_DTYPE:-<unset>} store_param_remainders=${STORE_PARAM_REMAINDERS:-<unset>}"
+echo "  NSYS: enabled=${ENABLE_NSYS}${NRL_NSYS_PROFILE_STEP_RANGE:+ step_range=${NRL_NSYS_PROFILE_STEP_RANGE}}"
 echo "  W&B: ${WANDB_GROUP}/${WANDB_PROJ}/${WANDB_NAME}-<slurm-job-id> (enabled=${WANDB_ENABLED})"
 echo "  Hugging Face cache: ${HF_HUB_CACHE}"
 echo "  MCore checkpoint cache: ${NRL_MEGATRON_CHECKPOINT_DIR}"
@@ -419,7 +514,7 @@ SBATCH_ARGS=(
   --exclusive
   --mem=0
   --dependency=singleton
-  --segment="${SBATCH_SEGMENT}"
+  --segment="${SEGMENT_SIZE}"
 )
 if [[ -n "${SBATCH_QOS}" ]]; then
   SBATCH_ARGS+=(--qos="${SBATCH_QOS}")
@@ -428,6 +523,7 @@ if [[ -n "${SBATCH_RESERVATION}" ]]; then
   SBATCH_ARGS+=(--reservation="${SBATCH_RESERVATION}")
 fi
 
+cd "${NEMORL}"
 BASE_LOG_DIR="${SLURM_LOG_DIR}" \
-MOUNTS="${MOUNTS:-/lustre:/lustre},${NEMORL}:${CONTAINER_NEMORL}" \
+MOUNTS="${MOUNTS:-/lustre:/lustre,/scratch:/scratch},${NEMORL}:${CONTAINER_NEMORL}" \
 sbatch "${SBATCH_ARGS[@]}" "${NEMORL}/ray.sub"
