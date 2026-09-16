@@ -5,9 +5,7 @@ set -euo pipefail
 # The default non-colocated layout matches the NeMo-RL v1 parity launchers:
 # two training nodes and six Megatron generation nodes.
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
-NEMORL="$(cd "${NEMORL}" && pwd -P)"
+NEMORL="/lustre/fsw/portfolios/coreai/users/cye/code/RL"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-${NEMORL}/workspace}"
 TASK="${TASK:-clevr}"
@@ -554,5 +552,5 @@ fi
 
 cd "${NEMORL}"
 BASE_LOG_DIR="${SLURM_LOG_DIR}" \
-MOUNTS="${MOUNTS:-/scratch:/scratch},${NEMORL}:${CONTAINER_NEMORL}" \
+MOUNTS="${MOUNTS:-/scratch:/scratch,/lustre:/lustre},${NEMORL}:${CONTAINER_NEMORL}" \
 sbatch "${SBATCH_ARGS[@]}" "${NEMORL}/ray.sub"
