@@ -450,6 +450,7 @@ def validate_and_set_config(
     optimizer_path,
     *,
     skip_weight_load: bool = False,
+    is_refit_destination: bool = False,
 ):
     # inference_optimized layers hard-require SP with TP>1; fail here with the config key.
     # This guards the training cfg; the inference cfg is guarded in
@@ -527,6 +528,7 @@ def validate_and_set_config(
         weights_path,
         optimizer_path,
         skip_weight_load=skip_weight_load,
+        is_refit_destination=is_refit_destination,
     )
 
     final_padded_vocab_size = calculate_padded_vocab_size(
@@ -792,6 +794,16 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
 
+    if config.get("megatron_cfg", {}).get("random_init", False):
+        if pretrained_ckpt is not None:
+            raise ValueError(
+                "policy.megatron_cfg.random_init=true cannot be combined with "
+                "policy.pretrained_checkpoint."
+            )
+        # model_name remains authoritative for tokenizer/processor metadata.
+        # No model checkpoint is imported or required for this path.
+        return config["model_name"], "", False
+
     if pretrained_ckpt is not None:
         fmt = pretrained_ckpt["format"]
         hf_model_name = config["model_name"]
@@ -901,6 +913,7 @@ def setup_model_config(
     optimizer_path: Optional[str] = None,
     *,
     skip_weight_load: bool = False,
+    is_refit_destination: bool = False,
 ) -> tuple[ConfigContainer, Any]:
     """Handle all the model configuration logic.
 
@@ -913,16 +926,37 @@ def setup_model_config(
         weights_path: Path to save/load training weights.
         optimizer_path: Path to the optimizer state (None if not resuming).
         skip_weight_load: This policy never loads the checkpoint (weights arrive via refit).
+        is_refit_destination: Build the ordinary integrated destination provider.
     """
     pretrained_ckpt = config.get("pretrained_checkpoint")
     fmt = pretrained_ckpt["format"] if pretrained_ckpt is not None else None
     validate_router_replay_config(config)
+    provider_name = config["megatron_cfg"].get("model_provider")
+    random_init = bool(config["megatron_cfg"].get("random_init", False))
 
-    derive_provider_from_hf = fmt == "megatron_lm" or (
+    derive_provider_from_hf = provider_name is None and (
+        fmt == "megatron_lm" or (
         skip_weight_load and fmt != "megatron_bridge"
+        )
     )
 
-    if derive_provider_from_hf:
+    if provider_name == "nemotron_mock_mimo":
+        if not random_init:
+            raise ValueError(
+                "The nemotron_mock_mimo provider currently requires "
+                "policy.megatron_cfg.random_init=true."
+            )
+        from nemo_rl.models.megatron.nemotron_mock_mimo_provider import (
+            build_nemotron_mock_provider,
+        )
+
+        model_cfg = build_nemotron_mock_provider(
+            config["megatron_cfg"].get("model_provider_config", {}),
+            is_refit_destination=is_refit_destination or skip_weight_load,
+        )
+    elif provider_name is not None:
+        raise ValueError(f"Unknown policy.megatron_cfg.model_provider={provider_name!r}.")
+    elif derive_provider_from_hf:
         from transformers import AutoConfig
 
         hf_config_overrides = config.get("hf_config_overrides", {}) or {}
@@ -993,23 +1027,15 @@ def setup_model_config(
             )
         model_cfg = _merge_model_overrides(model_cfg, model_overrides)
 
-    # Apply parallelism settings
-    _apply_parallelism_config(model_cfg, config)
-
-    # Apply optional multimodal provider settings
-    _apply_multimodal_config(model_cfg, config)
-
-    # Apply MoE settings
-    _apply_moe_config(model_cfg, config)
-
-    # Apply MTP settings
-    _apply_mtp_config(model_cfg, config)
-
-    # Apply precision settings
-    _apply_precision_config(model_cfg, config, dtype)
-
-    # Apply performance settings
-    _apply_performance_config(model_cfg, config)
+    if provider_name is None:
+        # Custom providers own their complete source/destination architecture;
+        # mutating only the outer MIMO adapter would make refit structures differ.
+        _apply_parallelism_config(model_cfg, config)
+        _apply_multimodal_config(model_cfg, config)
+        _apply_moe_config(model_cfg, config)
+        _apply_mtp_config(model_cfg, config)
+        _apply_precision_config(model_cfg, config, dtype)
+        _apply_performance_config(model_cfg, config)
 
     # Validate optimizer configuration
     _validate_optimizer_config(config)
@@ -1049,7 +1075,9 @@ def setup_model_config(
     )
 
     # Refit-fed policies never read the pretrained checkpoint (weights arrive via refit).
-    ckpt_pretrained_path: Optional[str] = None if skip_weight_load else pretrained_path
+    ckpt_pretrained_path: Optional[str] = (
+        None if skip_weight_load or random_init else pretrained_path
+    )
 
     # When fp8_param starts from a pretrained checkpoint, model params may already
     # be quantized before optimizer main params are initialized. Load main params
@@ -1759,12 +1787,14 @@ def _validate_training_config(config: PolicyConfig, model_cfg: Any) -> None:
         "https://github.com/NVIDIA-NeMo/RL/blob/bccbc377705a81a1f4b3c31ad9767bcc15f735a8/nemo_rl/algorithms/sft.py#L175-L179."
     )
 
-    ## These settings are required for correct gradient computations in mcore
-    ## when calculate_per_token_loss is True, there is no scaling of the gradient in mcore,
-    ## so we handle the scaling in nemo-rl.
+    ## These settings are required for correct gradient computations in mcore.
+    ## The standard path uses per-token loss scaling; GRPO needs materialized
+    ## language logits from the MIMO model, so that provider keeps it disabled.
     ## perform_initialization = True is a workaround to ensure the correct tensor parallel attributes are set
     ## on the TP-sharded parameters.
-    model_cfg.calculate_per_token_loss = True
+    model_cfg.calculate_per_token_loss = not bool(
+        config["megatron_cfg"].get("model_provider") == "nemotron_mock_mimo"
+    )
     model_cfg.perform_initialization = True
 
     # MoE aux loss validation - disabled to support aux loss normalization in RL SFT.
@@ -1856,6 +1886,33 @@ def _create_megatron_config(
             "use_gloo_process_groups"
         ]
 
+    # Bridge defers MCore post-init validation and derived fields until
+    # finalize(). NeMo-RL constructs ConfigContainer directly, bypassing
+    # Bridge's top-level finalization path.
+    optimizer_cfg = OptimizerConfig(**optimizer_kwargs)
+    optimizer_cfg.finalize()
+    ddp_cfg = DistributedDataParallelConfig(
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=config["megatron_cfg"][
+            "distributed_data_parallel_config"
+        ]["grad_reduce_in_fp32"],
+        overlap_grad_reduce=config["megatron_cfg"][
+            "distributed_data_parallel_config"
+        ]["overlap_grad_reduce"],
+        overlap_param_gather=overlap_param_gather,
+        # Required with calculate_per_token_loss=True.
+        average_in_collective=False,
+        use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
+            "use_distributed_optimizer"
+        ],
+        data_parallel_sharding_strategy=config["megatron_cfg"][
+            "distributed_data_parallel_config"
+        ]["data_parallel_sharding_strategy"],
+        reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
+        fp8_param_gather=fp8_param_enabled,
+    )
+    ddp_cfg.finalize()
+
     return ConfigContainer(
         model=model_cfg,
         checkpoint=checkpoint_config,
@@ -1866,28 +1923,8 @@ def _create_megatron_config(
             global_batch_size=config["train_global_batch_size"],  # ignored
             train_iters=config["megatron_cfg"]["train_iters"],
         ),
-        optimizer=OptimizerConfig(**optimizer_kwargs),
-        ddp=DistributedDataParallelConfig(
-            check_for_nan_in_grad=True,
-            grad_reduce_in_fp32=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["grad_reduce_in_fp32"],
-            overlap_grad_reduce=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["overlap_grad_reduce"],
-            overlap_param_gather=overlap_param_gather,
-            # we need to set average_in_collective=False with calculate_per_token_loss=T
-            # otherwise, mcore throws an assertion error.
-            average_in_collective=False,  # Required with calculate_per_token_loss=True
-            use_distributed_optimizer=config["megatron_cfg"]["optimizer"][
-                "use_distributed_optimizer"
-            ],
-            data_parallel_sharding_strategy=config["megatron_cfg"][
-                "distributed_data_parallel_config"
-            ]["data_parallel_sharding_strategy"],
-            reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf_for_mxfp8_param_ag,
-            fp8_param_gather=fp8_param_enabled,
-        ),
+        optimizer=optimizer_cfg,
+        ddp=ddp_cfg,
         scheduler=SchedulerConfig(**config["megatron_cfg"]["scheduler"]),
         dataset=None,
         tokenizer=TokenizerConfig(
@@ -2083,6 +2120,49 @@ def build_inference_model(
     inference_model = inference_model[0]
     inference_model.eval()
     return inference_model
+
+
+def _build_policy_model(
+    model_provider: ModelProviderMixin,
+    ddp_config: DistributedDataParallelConfig,
+    *,
+    use_torch_fsdp2: bool,
+    overlap_param_gather_with_optimizer_step: bool,
+    data_parallel_random_init: bool,
+    pre_wrap_hook: Optional[list[Callable]],
+    mixed_precision_wrapper: Callable,
+    pg_collection: ProcessGroupCollection,
+    wrap_with_ddp: bool = True,
+) -> list[MegatronModule]:
+    """Build an ordinary provider or MIMO's per-component DDP model."""
+    from megatron.bridge.models.megatron_mimo.megatron_mimo_provider import (
+        MegatronMIMOProvider,
+    )
+
+    if isinstance(model_provider, MegatronMIMOProvider):
+        # The ordinary Bridge get_model() path calls provider.provide() and wraps
+        # the outer MimoModel once. MIMO requires its provider override so the
+        # language and RADIO components each receive their own DDP/PG collection.
+        return model_provider.provide_distributed_model(
+            ddp_config=ddp_config,
+            use_torch_fsdp2=use_torch_fsdp2,
+            overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+            data_parallel_random_init=data_parallel_random_init,
+            pre_wrap_hook=pre_wrap_hook,
+            wrap_with_ddp=wrap_with_ddp,
+        )
+
+    return get_model(
+        model_provider,
+        ddp_config,
+        use_torch_fsdp2=use_torch_fsdp2,
+        overlap_param_gather_with_optimizer_step=overlap_param_gather_with_optimizer_step,
+        data_parallel_random_init=data_parallel_random_init,
+        pre_wrap_hook=pre_wrap_hook,
+        mixed_precision_wrapper=mixed_precision_wrapper,
+        pg_collection=pg_collection,
+        wrap_with_ddp=wrap_with_ddp,
+    )
 
 
 def setup_model_and_optimizer(
@@ -2345,15 +2425,15 @@ def setup_model_and_optimizer(
         patch_gpt_model_forward_for_linear_ce_fusion(
             chunk_size=policy_cfg["megatron_cfg"]["fused_linear_logprobs_chunk_size"]
         )
-    model = get_model(
+    model = _build_policy_model(
         megatron_cfg.model,
         megatron_cfg.ddp,
         use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
         overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
         data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
         pre_wrap_hook=pre_wrap_hook,
-        mixed_precision_wrapper=mixed_precision_wrapper,
         pg_collection=pg_collection,
+        mixed_precision_wrapper=mixed_precision_wrapper,
         wrap_with_ddp=load_optimizer,
     )
 
@@ -2618,7 +2698,7 @@ def setup_reference_model_state(
             )
 
     try:
-        reference_model = get_model(
+        reference_model = _build_policy_model(
             megatron_cfg.model,
             megatron_cfg.ddp,
             use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,

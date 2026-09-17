@@ -1,0 +1,135 @@
+defaults: ../../vlm_grpo_3B_megatron.yaml
+
+# One-node debug topology:
+#   GPUs 0-1: colocated MimoModel policy (Hybrid language + RADIO), TP=2/EP=2.
+#   GPUs 2-3: ordinary integrated LLaVAModel generation destination, TP=2/EP=2.
+# Native MCore MIMO-to-integrated refit requires draft Megatron-LM PR #7367.
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 2
+  max_num_steps: 4
+  val_period: 0
+  max_val_samples: null
+  val_batch_size: null
+  async_grpo:
+    enabled: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/nemotron-mock-mimo-grpo-1n4g
+
+policy:
+  # Used only for tokenizer and image-processor metadata. random_init prevents
+  # checkpoint conversion/loading.
+  model_name: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  is_vlm: true
+  train_global_batch_size: 2
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 1024
+  sequence_packing:
+    enabled: false
+  router_replay:
+    enabled: false
+  megatron_cfg:
+    model_provider: nemotron_mock_mimo
+    random_init: true
+    # Preserve the full 20-layer MEMEM*EMEMEM*EMEMEM* topology from the
+    # bundled 8-rank mock, but reduce language width 2688->512 and experts
+    # 128->8 for a two-policy-GPU structural/refit debug run.
+    model_provider_config:
+      hybrid_layer_pattern: "MEMEM*EMEMEM*EMEMEM*"
+      num_layers: 20
+      hidden_size: 512
+      num_attention_heads: 8
+      num_query_groups: 4
+      kv_channels: 64
+      ffn_hidden_size: 512
+      mamba_num_heads: 16
+      mamba_head_dim: 64
+      mamba_num_groups: 4
+      mamba_state_dim: 64
+      num_moe_experts: 8
+      moe_router_topk: 2
+      moe_ffn_hidden_size: 512
+      moe_shared_expert_intermediate_size: 1024
+      vocab_size: 131072
+      seq_length: 1024
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 2
+      expert_tensor_parallel_size: 1
+      sequence_parallel: true
+      calculate_per_token_loss: false
+    tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 2
+    expert_tensor_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: false
+    bias_activation_fusion: false
+    use_fused_linear_logprobs: false
+    moe_grouped_gemm: true
+    moe_shared_expert_overlap: false
+    optimizer:
+      use_precision_aware_optimizer: false
+      # This smoke does not need optimizer-state sharding.
+      use_distributed_optimizer: false
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+  generation:
+    backend: megatron
+    refit_transport: mcore
+    max_new_tokens: 64
+    bad_words: null
+    mcore_generation_config:
+      refit_backend: nccl
+      expose_http_server: true
+      buffer_size_gb: 1
+      num_cuda_graphs: 0
+      cuda_graph_impl: none
+      max_tokens: ${policy.max_total_sequence_length}
+      transformer_impl: transformer_engine
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 1
+      expert_tensor_parallel_size: 1
+      sequence_parallel: true
+      image_dynamic_resolution: true
+      vision_model_type: radio
+      logprobs_mode: raw_logprobs
+      megatron_inference_wrapper: megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper.VLMInferenceWrapper
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+
+data:
+  train:
+    dataset_name: clevr-cogent
+    split: train
+  validation:
+    dataset_name: clevr-cogent
+    split: valA
+  default:
+    prompt_file: examples/prompts/clevr_cogent_cot.txt
+    processor: vlm_hf_data_processor
+    env_name: clevr-cogent
+
+logger:
+  tensorboard_enabled: false
+  wandb_enabled: false
+
+cluster:
+  gpus_per_node: 4

@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.mimo import MimoModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -101,6 +102,44 @@ def _prepare_padding_mask_for_model(
         .transpose(0, 1)
         .contiguous()
     )
+
+
+def _prepare_mimo_modality_inputs(
+    model: MimoModel,
+    multimodal_data: Dict[str, torch.Tensor],
+) -> Dict[str, Dict[str, Dict[str, torch.Tensor]]]:
+    """Nest NeMo-RL's flat media inputs for MCore ``MimoModel.forward``.
+
+    NeMo-RL transports processor outputs as flat model kwargs, while MIMO routes
+    inputs by modality and encoder. The selected Nemotron mock RADIO encoder
+    names its image tensor ``x`` and accepts only its image-size metadata.
+    """
+    if not multimodal_data:
+        return {}
+
+    modality_specs = model.mimo_config.modality_submodules_spec
+    if len(modality_specs) != 1:
+        raise ValueError(
+            "NeMo-RL's flat multimodal batch can only be adapted automatically "
+            "for a MimoModel with exactly one modality."
+        )
+    modality_name, modality_spec = next(iter(modality_specs.items()))
+    encoder_specs = (modality_spec.submodules or {}).get("encoders", {})
+    if len(encoder_specs) != 1:
+        raise ValueError(
+            "NeMo-RL's flat multimodal batch can only be adapted automatically "
+            "for a MimoModel modality with exactly one encoder."
+        )
+    encoder_name = next(iter(encoder_specs))
+    encoder_inputs = dict(multimodal_data)
+    if encoder_name == "radio_encoder" and "pixel_values" in encoder_inputs:
+        encoder_inputs["x"] = encoder_inputs.pop("pixel_values")
+        encoder_inputs = {
+            key: value
+            for key, value in encoder_inputs.items()
+            if key in ("x", "imgs_sizes")
+        }
+    return {modality_name: {encoder_name: encoder_inputs}}
 
 
 @contextmanager
@@ -221,13 +260,38 @@ def model_forward(
         additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
-        output_tensor = model(
-            input_ids=input_ids_cp_sharded,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            **additional_kwargs,
-            **multimodal_data,
-        )
+        if isinstance(unwrap_model(model), MimoModel):
+            mimo_model = unwrap_model(model)
+            if packed_seq_params is not None:
+                raise NotImplementedError(
+                    "NeMo-RL sequence packing is not yet adapted to MimoModel.packing_kwargs."
+                )
+            if use_fused_linear_logprobs:
+                raise NotImplementedError(
+                    "Fused linear logprobs are not supported by MimoModel."
+                )
+            mimo_kwargs = {
+                key: value
+                for key, value in additional_kwargs.items()
+                if key in ("loss_mask", "labels")
+            }
+            output_tensor = model(
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                modality_inputs=_prepare_mimo_modality_inputs(
+                    mimo_model, multimodal_data
+                ),
+                **mimo_kwargs,
+            )
+        else:
+            output_tensor = model(
+                input_ids=input_ids_cp_sharded,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                **additional_kwargs,
+                **multimodal_data,
+            )
 
     # A model that slices context parallelism itself returns (output,
     # sliced_loss_mask) when it was handed a full-sequence loss_mask, so the

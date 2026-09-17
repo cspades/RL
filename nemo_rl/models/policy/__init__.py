@@ -352,6 +352,11 @@ class MegatronCheckpointConfig(TypedDict, total=False):
 class MegatronConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Explicit provider path used by debug/random-init integrations. model_name
+    # still supplies tokenizer/processor metadata.
+    model_provider: NotRequired[Literal["nemotron_mock_mimo"]]
+    model_provider_config: NotRequired[dict[str, Any]]
+    random_init: NotRequired[bool]
     # Arbitrary model-provider attributes applied recursively to the Megatron
     # Bridge model config before model instantiation. Keys must match configurable
     # provider fields and must not duplicate first-class megatron_cfg fields.

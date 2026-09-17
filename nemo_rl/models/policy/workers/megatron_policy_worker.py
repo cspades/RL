@@ -631,7 +631,7 @@ class MegatronPolicyWorkerImpl(
         # layer-spec hooks on ``self`` before calling
         # super().__init__() to inject quantization hooks into HF->Megatron
         # import. Refit-fed inference-only policies (skip_weight_load) skip the import entirely.
-        if not skip_weight_load:
+        if not skip_weight_load and not config["megatron_cfg"].get("random_init", False):
             handle_model_import(
                 config,
                 hf_model_name,
@@ -662,6 +662,7 @@ class MegatronPolicyWorkerImpl(
             weights_path,
             optimizer_path,
             skip_weight_load=skip_weight_load,
+            is_refit_destination=is_refit_destination,
         )
 
         self.megatron_cfg = runtime_config.megatron_cfg
@@ -4340,27 +4341,34 @@ class MegatronPolicyWorkerImpl(
         return model
 
     def move_optimizer(self, device: str):
-        # Iterate through the state dictionaries for each parameter group
+        # MimoOptimizer is a MegatronOptimizer aggregator whose top-level
+        # ``optimizer`` is intentionally None. Its real per-component
+        # optimizers are exposed through ``chained_optimizers``.
         if isinstance(self.optimizer, ChainedOptimizer):
-            optimizer_state = self.optimizer.state
+            optimizer_states = [self.optimizer.state]
+        elif getattr(self.optimizer, "chained_optimizers", None):
+            optimizer_states = [
+                optimizer._get_state()
+                for optimizer in self.optimizer.chained_optimizers
+            ]
         else:
-            optimizer_state = self.optimizer._get_state()
-        for _, state in optimizer_state.items():
-            # Iterate through the state items (e.g., momentum, variance) for a parameter
-            for k, v in state.items():
-                # Check if the item is a tensor
-                if torch.is_tensor(v):
-                    # Move the tensor to device and update the state dictionary
-                    if device == "cpu":
-                        if v.is_cuda:
-                            state[k] = v.to("cpu")
-                    elif device == "cuda":
-                        if not v.is_cuda:
-                            state[k] = v.to("cuda")
-                    else:
-                        raise ValueError(
-                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
-                        )
+            optimizer_states = [self.optimizer._get_state()]
+        for optimizer_state in optimizer_states:
+            for _, state in optimizer_state.items():
+                # Iterate through state items (for example momentum and variance).
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        if device == "cpu":
+                            if v.is_cuda:
+                                state[k] = v.to("cpu")
+                        elif device == "cuda":
+                            if not v.is_cuda:
+                                state[k] = v.to("cuda")
+                        else:
+                            raise ValueError(
+                                f"Invalid device: {device}. Only strings "
+                                "'cpu' and 'cuda' are supported."
+                            )
 
     def save_checkpoint(
         self,

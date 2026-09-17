@@ -128,7 +128,10 @@ def main() -> None:
         # setup data
         with rl_init_timer.time("data"):
             dataset, val_dataset, task_to_env, val_task_to_env = setup_response_data(
-                tokenizer, config.data, config.env
+                tokenizer,
+                config.data,
+                config.env,
+                is_vlm=config.policy.get("is_vlm", False),
             )
 
         with rl_init_timer.time("setup"):
