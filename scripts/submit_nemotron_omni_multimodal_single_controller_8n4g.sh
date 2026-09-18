@@ -107,7 +107,10 @@ fi
 
 MODEL_NAME="${MODEL_NAME:-nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16}"
 MAX_STEPS="${MAX_STEPS:-1000000}"
-NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-$((INFERENCE_DP_SIZE * 2))}"
+# Held fixed rather than derived from INFERENCE_DP_SIZE: that derivation made
+# train_global_batch_size a function of INFER_TP, so a generation-side topology
+# change silently rescaled the GRPO batch and the reward curve with it.
+NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-6}"
 NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-8}"
 TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))}"
 TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-1}"
@@ -171,10 +174,15 @@ MAMBA_INFERENCE_SSM_STATES_DTYPE="${MAMBA_INFERENCE_SSM_STATES_DTYPE:-float32}"
 OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-true}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
+VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
+# The mcore path always grants max_new_tokens, so set this false to compare the
+# two backends on an identical per-request generation budget.
+VLLM_CAP_MAX_TOKENS_TO_CONTEXT="${VLLM_CAP_MAX_TOKENS_TO_CONTEXT:-true}"
+VLLM_RESET_ENCODER_CACHE_AFTER_WEIGHT_UPDATE="${VLLM_RESET_ENCODER_CACHE_AFTER_WEIGHT_UPDATE:-false}"
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-4}"
 VLLM_REFIT_TIMEOUT_S="${VLLM_REFIT_TIMEOUT_S:-300}"
-MOE_BACKEND="${MOE_BACKEND:-flashinfer_trtllm}"
+MOE_BACKEND="${MOE_BACKEND:-flashinfer_cutlass}"
 REFIT_ENV_EXPORTS=""
 if [[ "${MEGATRON_TRANSFORMER_IMPL}" != "inference_optimized" &&
       "${MEGATRON_CUDA_GRAPH_IMPL}" == "local" && "${INFER_EP}" -gt 1 ]]; then
@@ -343,12 +351,12 @@ else
 ++policy.generation.vllm_cfg.pipeline_parallel_size=1 \
 ++policy.generation.vllm_cfg.expert_parallel_size=${INFER_EP} \
 ++policy.generation.vllm_cfg.max_model_len=${MAX_SEQUENCE_LENGTH} \
-++policy.generation.vllm_cfg.cap_max_tokens_to_context=true \
+++policy.generation.vllm_cfg.cap_max_tokens_to_context=${VLLM_CAP_MAX_TOKENS_TO_CONTEXT} \
 ++policy.generation.vllm_cfg.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION} \
 ++policy.generation.vllm_cfg.enforce_eager=${VLLM_ENFORCE_EAGER} \
-++policy.generation.vllm_cfg.enable_prefix_caching=true \
+++policy.generation.vllm_cfg.enable_prefix_caching=${VLLM_ENABLE_PREFIX_CACHING} \
 ++policy.generation.vllm_cfg.logprobs_mode=raw_logprobs \
-++policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update=false \
+++policy.generation.vllm_cfg.reset_encoder_cache_after_weight_update=${VLLM_RESET_ENCODER_CACHE_AFTER_WEIGHT_UPDATE} \
 ++policy.generation.vllm_kwargs.limit_mm_per_prompt.image=1 \
 ++policy.generation.vllm_kwargs.max_num_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS} \
 ++policy.generation.vllm_kwargs.mamba_ssm_cache_dtype=float32 \
