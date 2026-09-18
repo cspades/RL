@@ -56,6 +56,27 @@ export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-16}"
 export TRAIN_GBS="${TRAIN_GBS:-2048}"
 export MAX_STEPS="${MAX_STEPS:-1000000}"
 
+# Rollout-pump concurrency, both counted in prompt groups rather than requests.
+# MAX_INFLIGHT_PROMPTS is how many groups may be generating at once: one permit
+# per group, held until that group's slowest generation finishes, so a group of
+# 16 contributes far fewer than 16 concurrent requests once its short rows land.
+# MAX_BUFFERED_ROLLOUTS is how many finished-but-untrained groups may sit in the
+# DataPlane. The pump takes a buffer permit before the inflight one, making it
+# the outer backpressure bound that inflight can never exceed.
+export MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-128}"
+export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-256}"
+
+# Megatron's text-gen HTTP frontend tokenizes, preprocesses, and prefix-hashes
+# each request before the engine ever admits it, and for a 64-frame video that
+# is seconds of CPU per request. Increase this to speed up the CPU bottleneck.
+export HTTP_SERVER_NUM_REPLICAS="${HTTP_SERVER_NUM_REPLICAS:-32}"
+
+# Timeouts
+export NEMO_GYM_ROLLOUT_TIMEOUT_S="${NEMO_GYM_ROLLOUT_TIMEOUT_S:-1800}"
+export GENERATION_ROUTER_BACKEND_TIMEOUT_S="${GENERATION_ROUTER_BACKEND_TIMEOUT_S:-600}"
+export STALL_WATCHDOG_TIMEOUT_S="${STALL_WATCHDOG_TIMEOUT_S:-2400}"
+export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
+
 # Match the reference policy and its vLLM replica topology using MCore replicas.
 export POLICY_TP="${POLICY_TP:-2}"
 export POLICY_EP="${POLICY_EP:-16}"
@@ -97,7 +118,7 @@ export VIDEO_TEACHER_WANDB_ID="${VIDEO_TEACHER_WANDB_ID:-${VIDEO_TEACHER_WANDB_N
 export WANDB_PROJ="${WANDB_PROJ:-${VIDEO_TEACHER_WANDB_PROJECT}}"
 export WANDB_NAME="${WANDB_NAME:-${VIDEO_TEACHER_WANDB_NAME}}"
 export JOB_NAME="${JOB_NAME:-super-vl-35-videoqa-megatron-v2-32n4g}"
-export SBATCH_TIME="${SBATCH_TIME:-14:00:00}"
+export SBATCH_TIME="${SBATCH_TIME:-04:00:00}"
 export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
 
 # TASK=vstat supplies generic Nano-Omni defaults. Restore the validated Super
@@ -118,6 +139,7 @@ export EXTRA_OVERRIDES="\
 ++policy.hf_config_overrides.video_temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
 ++policy.hf_config_overrides.video_target_num_patches=${VIDEO_TARGET_PATCHES} \
 ++policy.hf_config_overrides.video_maintain_aspect_ratio=false \
+++policy.generation.mcore_generation_config.http_server_num_replicas=${HTTP_SERVER_NUM_REPLICAS} \
 ++policy.generation.mcore_generation_config.image_dynamic_resolution=true \
 ++policy.generation.mcore_generation_config.megatron_inference_wrapper=megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper \
 ++policy.generation.mcore_generation_config.parsers=[deepseek-r1-reasoning] \
@@ -125,12 +147,19 @@ export EXTRA_OVERRIDES="\
 ~data.default.video_sampling_style \
 ++data.default.video_maintain_aspect_ratio=false \
 ++grpo.deduplicate_multimodal_data=false \
+++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=${NEMO_GYM_ROLLOUT_TIMEOUT_S} \
+++async_rl.generation_router.enabled=true \
+++async_rl.generation_router.backend_timeout_s=${GENERATION_ROUTER_BACKEND_TIMEOUT_S} \
+++async_rl.generation_router.connect_timeout_s=5 \
+++async_rl.stall_watchdog.stall_timeout_s=${STALL_WATCHDOG_TIMEOUT_S} \
+++async_rl.stall_watchdog.stall_action=abort \
+++env.nemo_gym.initial_global_config_dict.global_aiohttp_client_request_debug=true \
 ++checkpointing.checkpoint_dir=${VIDEO_TEACHER_RESULTS_DIR}/checkpoints \
 ++checkpointing.save_data_plane=true \
 ++logger.log_dir=${VIDEO_TEACHER_RESULTS_DIR}/logs \
 ++logger.wandb.project=${VIDEO_TEACHER_WANDB_PROJECT} \
-++logger.wandb.name=${VIDEO_TEACHER_WANDB_NAME} \
-++logger.wandb.id=${VIDEO_TEACHER_WANDB_ID} \
+++logger.wandb.name=${VIDEO_TEACHER_WANDB_NAME}-\${NRL_SLURM_JOB_ID} \
+++logger.wandb.id=${VIDEO_TEACHER_WANDB_ID}-\${NRL_SLURM_JOB_ID} \
 ${USER_EXTRA_OVERRIDES}"
 
 exec bash "${SCRIPT_DIR}/submit_nemotron_omni_multimodal_single_controller_8n4g.sh" "$@"
