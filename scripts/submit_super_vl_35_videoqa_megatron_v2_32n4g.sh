@@ -56,6 +56,21 @@ export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-16}"
 export TRAIN_GBS="${TRAIN_GBS:-2048}"
 export MAX_STEPS="${MAX_STEPS:-1000000}"
 
+# Keep the Gym-to-engine request fanout within the 16 inference replicas'
+# aggregate admission capacity: 32 prompt groups x 16 generations = 512
+# requests, versus roughly 16 replicas x 36 active requests = 576 slots.
+export MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-32}"
+export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-256}"
+
+# Megatron's text-gen HTTP frontend tokenizes, preprocesses, and prefix-hashes
+# each request before the engine ever admits it, and for a 64-frame video that
+# is seconds of CPU per request. Increase this to speed up the CPU bottleneck.
+export HTTP_SERVER_NUM_REPLICAS="${HTTP_SERVER_NUM_REPLICAS:-32}"
+
+export NEMO_GYM_ROLLOUT_TIMEOUT_S="${NEMO_GYM_ROLLOUT_TIMEOUT_S:-7200}"
+export GENERATION_ROUTER_BACKEND_TIMEOUT_S="${GENERATION_ROUTER_BACKEND_TIMEOUT_S:-5400}"
+export STALL_WATCHDOG_TIMEOUT_S="${STALL_WATCHDOG_TIMEOUT_S:-9000}"
+
 # Match the reference policy and its vLLM replica topology using MCore replicas.
 export POLICY_TP="${POLICY_TP:-2}"
 export POLICY_EP="${POLICY_EP:-16}"
@@ -118,6 +133,7 @@ export EXTRA_OVERRIDES="\
 ++policy.hf_config_overrides.video_temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
 ++policy.hf_config_overrides.video_target_num_patches=${VIDEO_TARGET_PATCHES} \
 ++policy.hf_config_overrides.video_maintain_aspect_ratio=false \
+++policy.generation.mcore_generation_config.http_server_num_replicas=${HTTP_SERVER_NUM_REPLICAS} \
 ++policy.generation.mcore_generation_config.image_dynamic_resolution=true \
 ++policy.generation.mcore_generation_config.megatron_inference_wrapper=megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper \
 ++policy.generation.mcore_generation_config.parsers=[deepseek-r1-reasoning] \
@@ -125,6 +141,13 @@ export EXTRA_OVERRIDES="\
 ~data.default.video_sampling_style \
 ++data.default.video_maintain_aspect_ratio=false \
 ++grpo.deduplicate_multimodal_data=false \
+++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=${NEMO_GYM_ROLLOUT_TIMEOUT_S} \
+++async_rl.generation_router.enabled=true \
+++async_rl.generation_router.backend_timeout_s=${GENERATION_ROUTER_BACKEND_TIMEOUT_S} \
+++async_rl.generation_router.connect_timeout_s=5 \
+++async_rl.stall_watchdog.stall_timeout_s=${STALL_WATCHDOG_TIMEOUT_S} \
+++async_rl.stall_watchdog.stall_action=abort \
+++env.nemo_gym.initial_global_config_dict.global_aiohttp_client_request_debug=true \
 ++checkpointing.checkpoint_dir=${VIDEO_TEACHER_RESULTS_DIR}/checkpoints \
 ++checkpointing.save_data_plane=true \
 ++logger.log_dir=${VIDEO_TEACHER_RESULTS_DIR}/logs \
