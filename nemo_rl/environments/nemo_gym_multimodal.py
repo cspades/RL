@@ -12,12 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import copy
 import json
+import logging
 import os
+import threading
+import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from typing import Any, TypeVar, cast
 from urllib.parse import unquote, urlparse
@@ -57,14 +63,137 @@ from nemo_rl.models.generation.vllm.video_utils import (
 )
 
 _NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS = 8
+_NEMO_GYM_MEDIA_CACHE_MAX_BYTES = int(
+    os.environ.get("NEMO_GYM_MEDIA_CACHE_MAX_BYTES", str(512 * 1024**2))
+)
+
+logger = logging.getLogger(__name__)
+
+_PRESERVED_IMAGE_MIME_TYPES = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+}
+
+
+class _EncodedImageCache:
+    """Bounded process-local LRU for immutable local-image data URLs."""
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max(0, max_bytes)
+        self._entries: OrderedDict[tuple[str, int, int, int, int], str] = (
+            OrderedDict()
+        )
+        self._bytes = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def signature(source: str) -> tuple[str, int, int, int, int] | None:
+        parsed = urlparse(source)
+        if parsed.scheme == "file":
+            path = Path(unquote(parsed.path)).expanduser()
+        elif parsed.scheme:
+            return None
+        else:
+            path = Path(source).expanduser()
+        try:
+            resolved = path.resolve(strict=True)
+            stat = resolved.stat()
+        except OSError:
+            return None
+        return (
+            str(resolved),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+
+    def get(
+        self, signature: tuple[str, int, int, int, int] | None
+    ) -> str | None:
+        if signature is None or self._max_bytes == 0:
+            return None
+        with self._lock:
+            encoded = self._entries.pop(signature, None)
+            if encoded is None:
+                return None
+            self._entries[signature] = encoded
+            return encoded
+
+    def put(
+        self,
+        signature: tuple[str, int, int, int, int] | None,
+        encoded: str,
+    ) -> None:
+        if (
+            signature is None
+            or self._max_bytes == 0
+            or len(encoded) > self._max_bytes
+        ):
+            return
+        with self._lock:
+            previous = self._entries.pop(signature, None)
+            if previous is not None:
+                self._bytes -= len(previous)
+            self._entries[signature] = encoded
+            self._bytes += len(encoded)
+            while self._bytes > self._max_bytes and self._entries:
+                _, evicted = self._entries.popitem(last=False)
+                self._bytes -= len(evicted)
+
+    @property
+    def bytes(self) -> int:
+        with self._lock:
+            return self._bytes
+
+
+_ENCODED_IMAGE_CACHE = _EncodedImageCache(_NEMO_GYM_MEDIA_CACHE_MAX_BYTES)
 
 
 def _encode_single_image_source(source: str) -> str:
     """Resolve, encode, and close one local image source."""
+    encoded, _, _ = _encode_single_image_source_with_timing(source)
+    return encoded
+
+
+def _encode_single_image_source_with_timing(source: str) -> tuple[str, float, float]:
+    """Encode one local image and return load and serialization durations."""
+    parsed = urlparse(source)
+    if parsed.scheme == "file":
+        local_path: Path | None = Path(unquote(parsed.path)).expanduser()
+    elif not parsed.scheme:
+        local_path = Path(source).expanduser()
+    else:
+        local_path = None
+
+    if local_path is not None:
+        load_started_at = time.perf_counter()
+        raw_bytes = local_path.read_bytes()
+        # Validate the source before forwarding it. ``verify`` checks integrity without
+        # forcing an RGB->PNG transcode; the inference preprocessor performs the same
+        # final RGB conversion as policy preprocessing when it decodes these bytes.
+        with closing(Image.open(BytesIO(raw_bytes))) as image:
+            image_format = image.format
+            image.verify()
+        load_seconds = time.perf_counter() - load_started_at
+        mime_type = _PRESERVED_IMAGE_MIME_TYPES.get(str(image_format).upper())
+        if mime_type is not None:
+            encode_started_at = time.perf_counter()
+            encoded_payload = base64.b64encode(raw_bytes).decode("ascii")
+            encoded = f"data:{mime_type};base64,{encoded_payload}"
+            encode_seconds = time.perf_counter() - encode_started_at
+            return encoded, load_seconds, encode_seconds
+
     # `closing` (not a bare `with`): PIL's Image.__exit__ is a no-op, so only an
     # explicit close() releases the buffer.
+    load_started_at = time.perf_counter()
     with closing(resolve_to_image(source)) as image:
-        return image_to_data_url(image)
+        load_seconds = time.perf_counter() - load_started_at
+        encode_started_at = time.perf_counter()
+        encoded = image_to_data_url(image)
+        encode_seconds = time.perf_counter() - encode_started_at
+    return encoded, load_seconds, encode_seconds
 
 
 def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
@@ -145,16 +274,59 @@ def normalize_media_in_examples(nemo_gym_examples: list[dict]) -> list[dict]:
     sources = list(local_image_sources)
     encoded_by_source: dict[str, str] = {}
     if sources:
-        with ThreadPoolExecutor(
-            max_workers=_NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
-        ) as executor:
-            encoded_by_source = dict(
-                zip(
-                    sources,
-                    executor.map(_encode_single_image_source, sources),
-                    strict=True,
+        image_normalization_started_at = time.perf_counter()
+        signatures = {
+            source: _EncodedImageCache.signature(source) for source in sources
+        }
+        cache_hits = 0
+        uncached_sources = []
+        for source in sources:
+            encoded = _ENCODED_IMAGE_CACHE.get(signatures[source])
+            if encoded is None:
+                uncached_sources.append(source)
+            else:
+                cache_hits += 1
+                encoded_by_source[source] = encoded
+
+        encoded_results: list[tuple[str, float, float]] = []
+        if uncached_sources:
+            with ThreadPoolExecutor(
+                max_workers=_NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS
+            ) as executor:
+                encoded_results = list(
+                    executor.map(
+                        _encode_single_image_source_with_timing,
+                        uncached_sources,
+                    )
                 )
-            )
+            for source, result in zip(
+                uncached_sources, encoded_results, strict=True
+            ):
+                encoded_by_source[source] = result[0]
+                _ENCODED_IMAGE_CACHE.put(signatures[source], result[0])
+        image_normalization_seconds = time.perf_counter() - image_normalization_started_at
+        load_seconds = sum(result[1] for result in encoded_results)
+        encode_seconds = sum(result[2] for result in encoded_results)
+        max_image_seconds = max(
+            (result[1] + result[2] for result in encoded_results),
+            default=0.0,
+        )
+        logger.warning(
+            "Gym local-image normalization complete: unique_images=%d workers=%d "
+            "cache_hits=%d cache_misses=%d cache_bytes=%d "
+            "summed_file_load_validate_ms=%.1f summed_base64_serialize_ms=%.1f "
+            "max_image_ms=%.1f wall_ms=%.1f encoded_chars=%d",
+            len(sources),
+            min(_NEMO_GYM_IMAGE_ENCODE_MAX_WORKERS, len(uncached_sources)),
+            cache_hits,
+            len(uncached_sources),
+            _ENCODED_IMAGE_CACHE.bytes,
+            load_seconds * 1000,
+            encode_seconds * 1000,
+            max_image_seconds * 1000,
+            image_normalization_seconds * 1000,
+            sum(len(encoded) for encoded in encoded_by_source.values()),
+        )
 
     # Encode each unique video once. A video shared by G generations then points
     # every part at the same string, instead of G separate base64 copies of the

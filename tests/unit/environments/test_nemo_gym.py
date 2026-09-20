@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import base64
 import json
 import time
 from copy import deepcopy
@@ -278,6 +279,39 @@ def test_gym_local_video_path_is_inlined_as_data_url(tmp_path):
     assert video_url.startswith("data:video/mp4;base64,")
 
 
+def test_gym_local_jpeg_preserves_compressed_source_bytes(tmp_path):
+    image_path = tmp_path / "frame.jpg"
+    Image.new("RGB", (8, 8), color=(12, 34, 56)).save(
+        image_path, format="JPEG", quality=91
+    )
+    source_bytes = image_path.read_bytes()
+    examples = [
+        {
+            "responses_create_params": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "image_url": str(image_path),
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    ]
+
+    normalize_media_in_examples(examples)
+
+    image_url = examples[0]["responses_create_params"]["input"][0]["content"][0][
+        "image_url"
+    ]
+    assert image_url.startswith("data:image/jpeg;base64,")
+    assert base64.b64decode(image_url.split(",", 1)[1]) == source_bytes
+
+
 def test_video_path_to_data_url_rejects_unsupported_and_missing_paths(tmp_path):
     """Bad local video sources must fail loudly rather than inline garbage."""
     unsupported = tmp_path / "clip.gif"
@@ -484,6 +518,28 @@ def test_reattach_static_multimodal_payload_to_rollout_user_message():
     attach_static_multimodal_payload(target, source)
 
     assert target[1]["pixel_values"] is payload
+
+
+def test_reattach_rejects_media_payload_for_different_prompt_tokens():
+    payload = PackedTensor([torch.ones(2, 3)], dim_to_pack=0)
+    source = [
+        {
+            "role": "user",
+            "content": "",
+            "token_ids": torch.tensor([1, 2, 3]),
+            "pixel_values": payload,
+        }
+    ]
+    target = [
+        {
+            "role": "user",
+            "content": "",
+            "token_ids": torch.tensor([1, 2, 4]),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="prompt tokens disagree"):
+        attach_static_multimodal_payload(target, source)
 
 
 def test_video_datum_uses_temporal_processor_contract(monkeypatch, tmp_path):

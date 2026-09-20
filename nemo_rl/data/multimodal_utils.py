@@ -1968,6 +1968,10 @@ def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) 
     counts = image_counts_by_row(batch, input_ids.shape[0])
     if counts is None:
         return
-    mask = build_media_token_validity_mask(input_ids, media_token_id, counts)
+    mask = build_media_token_validity_mask(
+        input_ids,
+        media_token_id,
+        counts,
+    )
     if mask is not None:
         batch["media_token_validity_mask"] = mask

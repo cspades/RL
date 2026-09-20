@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections import Counter
 from collections.abc import AsyncGenerator, Mapping
 from dataclasses import dataclass, field
@@ -73,6 +74,7 @@ from nemo_rl.environments.nemo_gym_shards import (
 )
 from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.failures import (
+    GenerationAborted,
     GymTransportError,
     RolloutDataFailure,
     http_status_is_infra,
@@ -264,7 +266,23 @@ def _typed_gym_failure(error: Exception) -> Optional[Exception]:
     status = getattr(error, "status", None)
     if not isinstance(status, int):
         return None
-    detail = f"NeMo-Gym /run failed with HTTP {status}: {error}"
+    headers = getattr(error, "headers", None)
+    retryable_header = (
+        headers.get("x-nemo-retryable") if headers is not None else None
+    )
+    error_code = headers.get("x-nemo-error-code") if headers is not None else None
+    detail = (
+        f"NeMo-Gym /run failed with HTTP {status}"
+        f"{f' ({error_code})' if error_code else ''}: {error}"
+    )
+    # Structured policy from the generation router/frontend takes precedence over
+    # status-based inference. Gym's middleware preserves these headers while wrapping
+    # an inner failure in HTTP 500; treating every such 500 as retryable caused the RL
+    # row layer to replay generations that had already timed out and been aborted.
+    if error_code == "generation_aborted":
+        return GenerationAborted(detail)
+    if isinstance(retryable_header, str) and retryable_header.lower() == "false":
+        return RolloutDataFailure(detail)
     if http_status_is_infra(status):
         return GymTransportError(detail)
     return RolloutDataFailure(detail)
@@ -450,6 +468,9 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
+        self._active_rollout_stages: dict[str, dict[str, Any]] = {}
+        self._rollout_stage_heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._rollout_call_sequence = 0
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -468,6 +489,84 @@ class NemoGym(EnvironmentInterface):
                 "(see _PLACEHOLDER_STYLE_PROCESSOR_NAMES in nemo_rl/data/multimodal_utils.py); "
                 f"got {type(self._processor).__name__}. Update "
                 "attach_image_model_inputs_to_message before enabling."
+            )
+
+    @staticmethod
+    def _rollout_trace_id(row: dict[str, Any]) -> str:
+        """Return a stable group/row/attempt identifier for lifecycle logs."""
+        return (
+            f"{row.get('_ng_group_id', '<unknown>')}:"
+            f"{row.get('_rowidx', '<unknown>')}:"
+            f"{row.get('_ng_group_attempt', '<unknown>')}"
+        )
+
+    def _set_rollout_stage(self, trace_id: str, stage: str) -> None:
+        state = self._active_rollout_stages.get(trace_id)
+        if state is None:
+            print(
+                "NeMo-Gym actor stage: "
+                f"trace={trace_id} event=missing_state requested_stage={stage}",
+                flush=True,
+            )
+            return
+        now = time.monotonic()
+        previous_stage = state["stage"]
+        previous_started_at = state["stage_started_at"]
+        state["stage"] = stage
+        state["stage_started_at"] = now
+        state["last_progress_at"] = now
+        print(
+            "NeMo-Gym actor stage: "
+            f"trace={trace_id} event=transition from={previous_stage} to={stage} "
+            f"previous_stage_ms={(now - previous_started_at) * 1000:.1f} "
+            f"total_ms={(now - state['started_at']) * 1000:.1f}",
+            flush=True,
+        )
+
+    def _finish_rollout_stage(self, trace_id: str, outcome: str) -> None:
+        state = self._active_rollout_stages.pop(trace_id, None)
+        if state is None:
+            return
+        finished_at = time.monotonic()
+        print(
+            "NeMo-Gym actor stage: "
+            f"trace={trace_id} event=finished outcome={outcome} "
+            f"last_stage={state['stage']} "
+            f"total_ms={(finished_at - state['started_at']) * 1000:.1f}",
+            flush=True,
+        )
+
+    async def _rollout_stage_heartbeat(self) -> None:
+        """Report all blocked actor-side rollout stages without remote calls."""
+        while True:
+            await asyncio.sleep(30.0)
+            now = time.monotonic()
+            states = list(self._active_rollout_stages.items())
+            stage_counts = Counter(state["stage"] for _, state in states)
+            oldest = sorted(
+                (
+                    {
+                        "trace": trace_id,
+                        "stage": state["stage"],
+                        "age_s": round(now - state["started_at"], 1),
+                        "stage_age_s": round(now - state["stage_started_at"], 1),
+                    }
+                    for trace_id, state in states
+                ),
+                key=lambda item: item["age_s"],
+                reverse=True,
+            )[:10]
+            print(
+                "NeMo-Gym actor heartbeat: "
+                f"active={len(states)} stages={dict(stage_counts)} oldest={oldest}",
+                flush=True,
+            )
+
+    def _ensure_rollout_stage_heartbeat(self) -> None:
+        task = self._rollout_stage_heartbeat_task
+        if task is None or task.done():
+            self._rollout_stage_heartbeat_task = asyncio.create_task(
+                self._rollout_stage_heartbeat()
             )
 
     def _require_spinup(self) -> None:
@@ -754,101 +853,157 @@ Depending on your data shape, you may want to change these values."""
                 "NemoGym.set_tokenizer must be called before run_rollouts"
             )
         tokenizer = self._tokenizer
+        call_sequence = self._rollout_call_sequence
+        self._rollout_call_sequence += 1
+        trace_ids = [
+            f"{self._rollout_trace_id(row)}:{call_sequence}"
+            for row in nemo_gym_examples
+        ]
+        trace_by_rowidx = {
+            row.get("_rowidx"): trace_id
+            for row, trace_id in zip(nemo_gym_examples, trace_ids, strict=True)
+        }
+        call_trace = ",".join(trace_ids)
+        now = time.monotonic()
+        for trace_id in trace_ids:
+            self._active_rollout_stages[trace_id] = {
+                "stage": "normalize_media",
+                "started_at": now,
+                "stage_started_at": now,
+                "last_progress_at": now,
+            }
+        self._ensure_rollout_stage_heartbeat()
+        print(
+            "NeMo-Gym actor stage: "
+            f"trace={call_trace} event=start rows={len(nemo_gym_examples)} "
+            "stage=normalize_media",
+            flush=True,
+        )
 
         from nemo_rl.utils.fastokens import maybe_patch_fastokens
 
-        maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
+        try:
+            maybe_patch_fastokens(bool(self.cfg.get("use_fastokens")))
 
-        # Normalize local media before shipping requests to vLLM. Helper is a no-op
-        # for text-only rows and already-qualified URLs.
-        # Megatron's HTTP backend consumes the same normalized Responses payload.
-        normalize_media_in_examples(nemo_gym_examples)
+            # Normalize local media before shipping requests to vLLM. Helper is a no-op
+            # for text-only rows and already-qualified URLs.
+            # Megatron's HTTP backend consumes the same normalized Responses payload.
+            normalize_media_in_examples(nemo_gym_examples)
+            for trace_id in trace_ids:
+                self._set_rollout_stage(trace_id, "gym_dispatch")
 
-        timer = Timer()
-        timer.start("_run_rollouts_total")
-        nemo_gym_result_iterator = self.rch.run_examples(
-            examples=nemo_gym_examples, head_server_config=self.head_server_config
-        )
-        # Gym resolves task_source to agent_ref synchronously in run_examples().
-        # Build the counter afterward so completion rows use the resolved identity.
-        _require_resolved_agent_refs(nemo_gym_examples)
-        counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
-
-        num_results = 0
-        for task in nemo_gym_result_iterator:
-            with timer.time(label=f"{timer_prefix}/await_results"):
-                try:
-                    nemo_gym_row, nemo_gym_result = await task
-                except Exception as error:
-                    if hasattr(error, "response_content"):
-                        print(
-                            "EXCEPTION RESULT",
-                            error.response_content,
-                            file=sys.stderr,
-                        )
-                    typed = _typed_gym_failure(error)
-                    if typed is not None:
-                        # `from None`, deliberately: chaining the original would put the
-                        # unpicklable exception back on the wire as __cause__ and undo
-                        # the whole point. The status and message are already in `detail`.
-                        raise typed from None
-                    raise
-
-            with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                if self._token_capture_enabled:
-                    # Receipt mode: fetch the ledger manifest and assemble the
-                    # receipt locally; token-free result. The canonical row is
-                    # rebuilt by the finalizer, so no message_log walk (and no
-                    # NaN check) applies here.
-                    nemo_rl_result = await self._postprocess_receipt_mode(
-                        nemo_gym_row, nemo_gym_result
-                    )
-                else:
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_row,
-                        nemo_gym_result,
-                        tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
-                    )
-                    if _has_nan_generation_logprobs(nemo_rl_result):
-                        raise RuntimeError("Generation logprobs contain NaN")
-            num_results += 1
-            timing_metrics = None
-            if num_results == len(nemo_gym_examples):
-                timer.stop("_run_rollouts_total")
-                timing_metrics = timer.get_timing_metrics("sum")
-                total_time = timing_metrics.pop("_run_rollouts_total")
-                timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
-                    100
-                    * timing_metrics[f"{timer_prefix}/postprocess_results"]
-                    / total_time
-                )
-
-            agent_name = nemo_gym_row["agent_ref"]["name"]
-            counts_left[agent_name] -= 1
-            if counts_left[agent_name] <= 0:
-                counts_left.pop(agent_name)
-            if num_results % 10 == 0 and counts_left:
-                top_left = counts_left.most_common(5)
-                top_left_str = "\n".join(
-                    f"{index + 1}. {name}: {count}"
-                    for index, (name, count) in enumerate(top_left)
-                )
-                print(
-                    "Top 5 NeMo Gym agent refs left in this rollout batch: "
-                    f"{top_left_str}",
-                    file=sys.stderr,
-                )
-
-            # task_source is resolved to agent_ref inside this Ray actor, after
-            # the caller's row was serialized. Return the resolved ref explicitly
-            # so the caller can hydrate its own row copy before postprocessing.
-            yield (
-                nemo_gym_row["_rowidx"],
-                nemo_gym_row["agent_ref"],
-                nemo_rl_result,
-                timing_metrics,
+            timer = Timer()
+            timer.start("_run_rollouts_total")
+            nemo_gym_result_iterator = self.rch.run_examples(
+                examples=nemo_gym_examples, head_server_config=self.head_server_config
             )
+            # Gym resolves task_source to agent_ref synchronously in run_examples().
+            # Build the counter afterward so completion rows use the resolved identity.
+            _require_resolved_agent_refs(nemo_gym_examples)
+            counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
+
+            num_results = 0
+            for task in nemo_gym_result_iterator:
+                for trace_id in trace_ids:
+                    if trace_id in self._active_rollout_stages:
+                        self._set_rollout_stage(trace_id, "await_gym_result")
+                with timer.time(label=f"{timer_prefix}/await_results"):
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except Exception as error:
+                        print(
+                            "NeMo-Gym actor stage: "
+                            f"trace={call_trace} event=error stage=await_gym_result "
+                            f"error={type(error).__name__}: {error!r}",
+                            flush=True,
+                        )
+                        if hasattr(error, "response_content"):
+                            print(
+                                "EXCEPTION RESULT",
+                                error.response_content,
+                                file=sys.stderr,
+                            )
+                        typed = _typed_gym_failure(error)
+                        if typed is not None:
+                            # `from None`, deliberately: chaining the original would put the
+                            # unpicklable exception back on the wire as __cause__ and undo
+                            # the whole point. The status and message are already in `detail`.
+                            raise typed from None
+                        raise
+
+                result_trace = trace_by_rowidx.get(
+                    nemo_gym_row.get("_rowidx"),
+                    self._rollout_trace_id(nemo_gym_row),
+                )
+                self._set_rollout_stage(result_trace, "postprocess_result")
+                with timer.time(label=f"{timer_prefix}/postprocess_results"):
+                    if self._token_capture_enabled:
+                        # Receipt mode: fetch the ledger manifest and assemble the
+                        # receipt locally; token-free result. The canonical row is
+                        # rebuilt by the finalizer, so no message_log walk (and no
+                        # NaN check) applies here.
+                        nemo_rl_result = await self._postprocess_receipt_mode(
+                            nemo_gym_row, nemo_gym_result
+                        )
+                    else:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_row,
+                            nemo_gym_result,
+                            tokenizer,
+                            include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        )
+                        if _has_nan_generation_logprobs(nemo_rl_result):
+                            raise RuntimeError("Generation logprobs contain NaN")
+                num_results += 1
+                timing_metrics = None
+                if num_results == len(nemo_gym_examples):
+                    timer.stop("_run_rollouts_total")
+                    timing_metrics = timer.get_timing_metrics("sum")
+                    total_time = timing_metrics.pop("_run_rollouts_total")
+                    timing_metrics[f"{timer_prefix}/postprocess_results_pct"] = (
+                        100
+                        * timing_metrics[f"{timer_prefix}/postprocess_results"]
+                        / total_time
+                    )
+
+                agent_name = nemo_gym_row["agent_ref"]["name"]
+                counts_left[agent_name] -= 1
+                if counts_left[agent_name] <= 0:
+                    counts_left.pop(agent_name)
+                if num_results % 10 == 0 and counts_left:
+                    top_left = counts_left.most_common(5)
+                    top_left_str = "\n".join(
+                        f"{index + 1}. {name}: {count}"
+                        for index, (name, count) in enumerate(top_left)
+                    )
+                    print(
+                        "Top 5 NeMo Gym agent refs left in this rollout batch: "
+                        f"{top_left_str}",
+                        file=sys.stderr,
+                    )
+
+                # task_source is resolved to agent_ref inside this Ray actor, after
+                # the caller's row was serialized. Return the resolved ref explicitly
+                # so the caller can hydrate its own row copy before postprocessing.
+                self._set_rollout_stage(result_trace, "yield_result")
+                yield (
+                    nemo_gym_row["_rowidx"],
+                    nemo_gym_row["agent_ref"],
+                    nemo_rl_result,
+                    timing_metrics,
+                )
+                self._set_rollout_stage(result_trace, "yield_resumed")
+                self._finish_rollout_stage(result_trace, "delivered")
+        except asyncio.CancelledError:
+            print(
+                "NeMo-Gym actor stage: "
+                f"trace={call_trace} event=cancelled",
+                flush=True,
+            )
+            raise
+        finally:
+            for trace_id in trace_ids:
+                self._finish_rollout_stage(trace_id, "generator_closed")
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict

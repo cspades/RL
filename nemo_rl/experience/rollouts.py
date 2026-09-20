@@ -266,6 +266,35 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        source_owns_media = any(
+            isinstance(value, PackedTensor) for value in source.values()
+        )
+        source_tokens = source.get("token_ids")
+        target_tokens = target.get("token_ids")
+        if (
+            source_owns_media
+            and isinstance(source_tokens, torch.Tensor)
+            and isinstance(target_tokens, torch.Tensor)
+            and not torch.equal(source_tokens, target_tokens)
+        ):
+            mismatch = (
+                torch.nonzero(source_tokens != target_tokens, as_tuple=False)
+                if source_tokens.shape == target_tokens.shape
+                else None
+            )
+            first_mismatch = (
+                int(mismatch[0].item())
+                if mismatch is not None and mismatch.numel() > 0
+                else None
+            )
+            raise ValueError(
+                "Gym/Megatron prompt tokens disagree with the policy processor "
+                "for a media-bearing prompt. Training cannot pair one token "
+                "sequence with media tensors produced for another. "
+                f"policy_tokens={source_tokens.numel()}, "
+                f"generation_tokens={target_tokens.numel()}, "
+                f"first_mismatch={first_mismatch}."
+            )
         for key, value in source.items():
             if isinstance(value, PackedTensor) or key in VLLM_PROMPT_KEYS:
                 target[key] = value

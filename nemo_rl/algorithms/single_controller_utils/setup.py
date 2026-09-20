@@ -932,6 +932,15 @@ def _maybe_start_generation_router(
         backend_timeout_s=router_config.backend_timeout_s,
         connect_timeout_s=router_config.connect_timeout_s,
         no_healthy_backend_status=router_config.no_healthy_backend_status,
+        diagnostics_interval_s=router_config.diagnostics_interval_s,
+        admission_enabled=router_config.admission_enabled,
+        max_inflight_requests=router_config.max_inflight_requests,
+        max_inflight_requests_per_backend=(
+            router_config.max_inflight_requests_per_backend
+        ),
+        max_inflight_request_bytes=router_config.max_inflight_request_bytes,
+        unknown_request_bytes=router_config.unknown_request_bytes,
+        request_body_timeout_s=router_config.request_body_timeout_s,
         # Only a monitor-driven run ever pushes membership, and the router's reflex drop
         # of a failing backend is only safe because a later push restores it. Without
         # one, arming the reflex would retire backends permanently.
@@ -1984,6 +1993,9 @@ def setup_single_controller(
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
         ),
         retry_policy=_build_retry_policy(master_config),
+        max_concurrent_gym_rows=(
+            master_config.async_rl.rollout_failure.nemo_gym.max_concurrent_rows
+        ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
     )
 
