@@ -94,6 +94,7 @@ class _Harness:
             # On by default here: the reflex drop is the behaviour under test in most of
             # these cases, and a real run only enables the router alongside fleet health.
             health_managed=router_kwargs.pop("health_managed", True),
+            admission_enabled=router_kwargs.pop("admission_enabled", False),
             **router_kwargs,
         )
         self._runner: web.AppRunner | None = None
@@ -332,6 +333,102 @@ class _HangingBackend(_Backend):
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         await web.TCPSite(self._runner, "127.0.0.1", self.port).start()
+
+
+class _BlockingBackend(_Backend):
+    """Records admission concurrency and waits until the test releases it."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.entered: asyncio.Event | None = None
+        self.release: asyncio.Event | None = None
+        self.active = 0
+        self.max_active = 0
+
+    async def start(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        app = web.Application()
+
+        async def _handle(request: web.Request) -> web.Response:
+            body = await request.read()
+            self.requests.append((request.method, request.path, body))
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.entered.set()
+            try:
+                await self.release.wait()
+                return web.Response(status=200, body=b'{"ok":true}')
+            finally:
+                self.active -= 1
+
+        app.router.add_route("*", "/{tail:.*}", _handle)
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, "127.0.0.1", self.port).start()
+
+
+class TestRouterAdmission:
+    def test_global_and_per_backend_limits_bound_forwarding(self):
+        backend = _BlockingBackend("b0")
+
+        async def _main():
+            async with _Harness(
+                [backend],
+                admission_enabled=True,
+                max_inflight_requests=1,
+                max_inflight_requests_per_backend=1,
+                max_inflight_request_bytes=1024,
+                unknown_request_bytes=128,
+            ) as harness:
+                async with ClientSession() as session:
+                    url = f"http://127.0.0.1:{harness.port}/v1/chat/completions"
+
+                    async def _call():
+                        async with session.post(url, data=b"{}") as response:
+                            return response.status
+
+                    first = asyncio.create_task(_call())
+                    assert backend.entered is not None
+                    await asyncio.wait_for(backend.entered.wait(), timeout=1.0)
+                    second = asyncio.create_task(_call())
+                    await asyncio.sleep(0.05)
+
+                    snapshot = harness.router.diagnostics()
+                    assert snapshot["admission"]["requests"] == 1
+                    assert snapshot["admission"]["waiters"] == 1
+                    assert snapshot["active_by_phase"][
+                        "waiting_for_router_admission"
+                    ] == 1
+                    assert backend.max_active == 1
+
+                    assert backend.release is not None
+                    backend.release.set()
+                    assert await asyncio.gather(first, second) == [200, 200]
+                    assert backend.max_active == 1
+                    assert harness.router.diagnostics()["admission"]["requests"] == 0
+
+        asyncio.run(_main())
+
+    def test_request_larger_than_the_byte_budget_is_rejected_before_backend(self):
+        backend = _Backend("b0")
+
+        async def _main():
+            async with _Harness(
+                [backend],
+                admission_enabled=True,
+                max_inflight_request_bytes=3,
+                unknown_request_bytes=1,
+            ) as harness:
+                status, body, headers = await harness.call(
+                    "/v1/chat/completions", body=b"four"
+                )
+                assert status == 413
+                assert headers["X-Nemo-Retryable"] == "false"
+                assert b"exceeds router byte budget" in body
+                assert backend.requests == []
+
+        asyncio.run(_main())
 
 
 class TestBackendErrorHandling:
