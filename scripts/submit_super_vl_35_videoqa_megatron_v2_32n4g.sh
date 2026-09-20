@@ -21,7 +21,9 @@ DATA_HOST_ROOT="${NEMORL}/${DATA_REL}"
 
 export VIDEO_TEACHER_MODEL_PATH="${VIDEO_TEACHER_MODEL_PATH:-${CONTAINER_NEMORL}/${MODEL_REL}}"
 export VIDEO_TEACHER_DATA_PATH="${VIDEO_TEACHER_DATA_PATH:-${CONTAINER_NEMORL}/${DATA_REL}/${DATA_FILENAME}}"
-export VIDEO_TEACHER_MEDIA_ROOT="${VIDEO_TEACHER_MEDIA_ROOT:-${CONTAINER_NEMORL}/${DATA_REL}}"
+# The manifest contains absolute paths from multiple shared media trees
+# (including llmservice and nemotron); this is their mounted common allowlist.
+export VIDEO_TEACHER_MEDIA_ROOT="${VIDEO_TEACHER_MEDIA_ROOT:-/lustre/fs1/portfolios}"
 
 if [[ ! -f "${MODEL_HOST_PATH}/config.json" ]]; then
   echo "Missing copied HF checkpoint: ${MODEL_HOST_PATH}" >&2
@@ -56,25 +58,45 @@ export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-16}"
 export TRAIN_GBS="${TRAIN_GBS:-2048}"
 export MAX_STEPS="${MAX_STEPS:-1000000}"
 
-# Rollout-pump concurrency, both counted in prompt groups rather than requests.
-# MAX_INFLIGHT_PROMPTS is how many groups may be generating at once: one permit
-# per group, held until that group's slowest generation finishes, so a group of
-# 16 contributes far fewer than 16 concurrent requests once its short rows land.
+# Rollout-pump concurrency. MAX_INFLIGHT_PROMPTS still counts prompt groups, but
+# MAX_CONCURRENT_GYM_ROWS bounds complete Gym row lifecycles. Rows wait locally
+# in RL before entering Gym, preventing the 128 * 16 request burst. A permit is
+# released after that row's agent, generation, reward, and postprocessing finish.
 # MAX_BUFFERED_ROLLOUTS is how many finished-but-untrained groups may sit in the
 # DataPlane. The pump takes a buffer permit before the inflight one, making it
 # the outer backpressure bound that inflight can never exceed.
-export MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-128}"
+export MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-16}"
+# Request slots are not the limiting resource for this workload: each Gym row carries
+# a 16-71 MB base64 media body before it reaches an engine. Eight rows per each of the
+# 16 DP backends keeps the HTTP/media path bounded while still supplying decode batches.
+export MAX_CONCURRENT_GYM_ROWS="${MAX_CONCURRENT_GYM_ROWS:-128}"
 export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-256}"
+export GENERATION_ROUTER_MAX_INFLIGHT="${GENERATION_ROUTER_MAX_INFLIGHT:-128}"
+export GENERATION_ROUTER_MAX_INFLIGHT_PER_BACKEND="${GENERATION_ROUTER_MAX_INFLIGHT_PER_BACKEND:-8}"
+export GENERATION_ROUTER_MAX_INFLIGHT_BYTES="${GENERATION_ROUTER_MAX_INFLIGHT_BYTES:-4294967296}"
+export GENERATION_ROUTER_UNKNOWN_REQUEST_BYTES="${GENERATION_ROUTER_UNKNOWN_REQUEST_BYTES:-67108864}"
+export GENERATION_ROUTER_REQUEST_BODY_TIMEOUT_S="${GENERATION_ROUTER_REQUEST_BODY_TIMEOUT_S:-120}"
+# Cache normalized data URLs across sibling generations and bounded retries. The key
+# includes canonical path, device, inode, size, and mtime, so changed or replaced files
+# cannot reuse stale bytes.
+export NEMO_GYM_MEDIA_CACHE_MAX_BYTES="${NEMO_GYM_MEDIA_CACHE_MAX_BYTES:-2147483648}"
 
-# Megatron's text-gen HTTP frontend tokenizes, preprocesses, and prefix-hashes
-# each request before the engine ever admits it, and for a 64-frame video that
-# is seconds of CPU per request. Increase this to speed up the CPU bottleneck.
-export HTTP_SERVER_NUM_REPLICAS="${HTTP_SERVER_NUM_REPLICAS:-32}"
+# Frame manifests keep frontend work small, and each ASGI replica can await many
+# generations concurrently. Four replicas per backend provide CPU parallelism
+# without creating 512 forked HTTP processes and ZMQ clients across the fleet.
+export HTTP_SERVER_NUM_REPLICAS="${HTTP_SERVER_NUM_REPLICAS:-4}"
+# Request IDs and client identities are required to correlate router, frontend,
+# coordinator, and engine boundaries. Ray's numeric-log deduplication otherwise
+# hides precisely the repeated per-request records needed to diagnose a stall.
+export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 
 # Timeouts
-export NEMO_GYM_ROLLOUT_TIMEOUT_S="${NEMO_GYM_ROLLOUT_TIMEOUT_S:-1800}"
-export GENERATION_ROUTER_BACKEND_TIMEOUT_S="${GENERATION_ROUTER_BACKEND_TIMEOUT_S:-600}"
-export STALL_WATCHDOG_TIMEOUT_S="${STALL_WATCHDOG_TIMEOUT_S:-2400}"
+# Keep the Gym deadline above the router deadline so the router/frontend can
+# abort admitted engine work and return a structured generation_aborted error.
+export NEMO_GYM_ROLLOUT_TIMEOUT_S="${NEMO_GYM_ROLLOUT_TIMEOUT_S:-2100}"
+export GENERATION_ROUTER_BACKEND_TIMEOUT_S="${GENERATION_ROUTER_BACKEND_TIMEOUT_S:-1800}"
+export GENERATION_ROUTER_DIAGNOSTICS_INTERVAL_S="${GENERATION_ROUTER_DIAGNOSTICS_INTERVAL_S:-30}"
+export STALL_WATCHDOG_TIMEOUT_S="${STALL_WATCHDOG_TIMEOUT_S:-12600}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 
 # Match the reference policy and its vLLM replica topology using MCore replicas.
@@ -105,8 +127,8 @@ export OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-false}"
 export OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-false}"
 export EMPTY_UNUSED_MEMORY_LEVEL="${EMPTY_UNUSED_MEMORY_LEVEL:-2}"
 export BUFFER_SIZE_GB="${BUFFER_SIZE_GB:-16}"
-export PREFIX_CACHING_MAMBA_GB="${PREFIX_CACHING_MAMBA_GB:-20}"
-export VISION_EMBEDDING_CACHE_MAX_BYTES="${VISION_EMBEDDING_CACHE_MAX_BYTES:-2147483648}"
+export PREFIX_CACHING_MAMBA_GB="${PREFIX_CACHING_MAMBA_GB:-32}"
+export VISION_EMBEDDING_CACHE_MAX_BYTES="${VISION_EMBEDDING_CACHE_MAX_BYTES:-17179869184}"
 
 export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-true}"
 export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-videoqa-megatron-v2}"
@@ -143,16 +165,30 @@ export EXTRA_OVERRIDES="\
 ++policy.generation.mcore_generation_config.image_dynamic_resolution=true \
 ++policy.generation.mcore_generation_config.megatron_inference_wrapper=megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper \
 ++policy.generation.mcore_generation_config.parsers=[deepseek-r1-reasoning] \
+++policy.generation.mcore_generation_config.video_maintain_aspect_ratio=false \
+++policy.generation.ignore_eos=false \
 ++policy.generation.bad_words=\"['<image>','<img>','</img>','<so_embedding>','<so_start>','<so_end>']\" \
-~data.default.video_sampling_style \
+++data.default.video_sampling_style=nemotron_vl \
 ++data.default.video_maintain_aspect_ratio=false \
 ++grpo.deduplicate_multimodal_data=false \
 ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=${NEMO_GYM_ROLLOUT_TIMEOUT_S} \
+++async_rl.rollout_failure.nemo_gym.max_concurrent_rows=${MAX_CONCURRENT_GYM_ROWS} \
+++async_rl.sampler.name=ready_first \
+++async_rl.sampler.max_staleness_versions=1 \
 ++async_rl.generation_router.enabled=true \
 ++async_rl.generation_router.backend_timeout_s=${GENERATION_ROUTER_BACKEND_TIMEOUT_S} \
 ++async_rl.generation_router.connect_timeout_s=5 \
+++async_rl.generation_router.diagnostics_interval_s=${GENERATION_ROUTER_DIAGNOSTICS_INTERVAL_S} \
+++async_rl.generation_router.admission_enabled=true \
+++async_rl.generation_router.max_inflight_requests=${GENERATION_ROUTER_MAX_INFLIGHT} \
+++async_rl.generation_router.max_inflight_requests_per_backend=${GENERATION_ROUTER_MAX_INFLIGHT_PER_BACKEND} \
+++async_rl.generation_router.max_inflight_request_bytes=${GENERATION_ROUTER_MAX_INFLIGHT_BYTES} \
+++async_rl.generation_router.unknown_request_bytes=${GENERATION_ROUTER_UNKNOWN_REQUEST_BYTES} \
+++async_rl.generation_router.request_body_timeout_s=${GENERATION_ROUTER_REQUEST_BODY_TIMEOUT_S} \
+++async_rl.generation_fleet_health.enabled=false \
 ++async_rl.stall_watchdog.stall_timeout_s=${STALL_WATCHDOG_TIMEOUT_S} \
 ++async_rl.stall_watchdog.stall_action=abort \
+++async_rl.stall_watchdog.gym_subprocess_check=false \
 ++env.nemo_gym.initial_global_config_dict.global_aiohttp_client_request_debug=true \
 ++checkpointing.checkpoint_dir=${VIDEO_TEACHER_RESULTS_DIR}/checkpoints \
 ++checkpointing.save_data_plane=true \

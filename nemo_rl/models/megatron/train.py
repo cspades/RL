@@ -188,6 +188,10 @@ def model_forward(
     multimodal_data = data_dict.get_multimodal_dict(
         as_tensors=True, device=input_ids_cp_sharded.device
     )
+    # This field uses the multimodal registry for transport, but its model-layout
+    # version is packed/CP-selected alongside input_ids by the data iterator.
+    # Never pass the unprocessed rectangular copy from data_dict.
+    multimodal_data.pop("media_token_validity_mask", None)
     # VLM wrappers normally derive their own positions or expand the token sequence,
     # so position_ids are dropped for multimodal batches.
     # A model that consumes caller-packed THD inputs keeps them:

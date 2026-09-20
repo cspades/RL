@@ -519,10 +519,34 @@ class TestGenerationRouterPortAndTimeoutValidation:
         cfg = GenerationRouterConfig()
         assert cfg.connect_timeout_s == 5.0
         assert cfg.connect_timeout_s < cfg.backend_timeout_s
+        assert cfg.admission_enabled is False
 
     def test_a_connect_timeout_beyond_the_total_is_rejected(self):
         with pytest.raises(ValidationError, match="connect_timeout_s"):
             GenerationRouterConfig(connect_timeout_s=100.0, backend_timeout_s=10.0)
+
+    def test_per_backend_admission_cannot_exceed_global_admission(self):
+        with pytest.raises(
+            ValidationError, match="max_inflight_requests_per_backend"
+        ):
+            GenerationRouterConfig(
+                max_inflight_requests=8,
+                max_inflight_requests_per_backend=9,
+            )
+
+    def test_unknown_body_reservation_must_fit_the_byte_budget(self):
+        with pytest.raises(ValidationError, match="unknown_request_bytes"):
+            GenerationRouterConfig(
+                max_inflight_request_bytes=1024,
+                unknown_request_bytes=1025,
+            )
+
+    def test_request_body_timeout_must_fit_the_backend_deadline(self):
+        with pytest.raises(ValidationError, match="request_body_timeout_s"):
+            GenerationRouterConfig(
+                backend_timeout_s=10.0,
+                request_body_timeout_s=11.0,
+            )
 
 
 class TestFleetHealthSelectionIsNotAdvertisedBeyondWhatItDoes:

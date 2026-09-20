@@ -96,6 +96,12 @@ class NemoGymRolloutFTConfig(BaseModel, extra="allow"):
     # bad row takes every later row with it; recovering those individually is much
     # cheaper than redoing all num_generations_per_prompt of them.
     max_row_attempts: PositiveInt = 3
+    # Global cap on individual NeMo-Gym rows admitted by one controller actor.
+    # Prompt-level concurrency is the wrong unit for GRPO: one prompt expands into
+    # num_generations_per_prompt independent rows. A permit covers the complete
+    # nested Gym row lifecycle, not only its model call. None preserves legacy
+    # batched admission.
+    max_concurrent_rows: Optional[PositiveInt] = None
 
 
 class RolloutFailureConfig(BaseModel, extra="allow"):
@@ -406,6 +412,28 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
     connect_timeout_s: PositiveFloat = 5.0
     # Status returned when no shard is eligible.
     no_healthy_backend_status: PositiveInt = 409
+    # Emit a centralized request-flow heartbeat from the router actor. Unlike
+    # controller telemetry, this is visible in the Ray driver log and distinguishes
+    # "Gym stopped sending" from "requests reached the router but a backend retained
+    # them". None disables the heartbeat.
+    diagnostics_interval_s: Optional[PositiveFloat] = 30.0
+    # Opt-in so existing vLLM router users retain the legacy unlimited forwarding
+    # behavior. Large multimodal Megatron recipes enable this explicitly.
+    admission_enabled: bool = False
+    # Explicit forwarding admission. The router accepts inbound HTTP connections but
+    # does not open an unbounded number of multi-megabyte backend streams.
+    max_inflight_requests: PositiveInt = 128
+    max_inflight_requests_per_backend: PositiveInt = 8
+    # Byte-weighted request-body admission. Bytes are released at request-body EOF,
+    # independently of the request permit held through generation and response relay.
+    max_inflight_request_bytes: PositiveInt = 4 * 1024**3
+    # Reservation for chunked requests without Content-Length. It grows under the same
+    # byte budget if the body exceeds this estimate.
+    unknown_request_bytes: PositiveInt = 64 * 1024**2
+    # Completed bodies in the motivating run took at most 3.4s. A separate body
+    # deadline prevents a half-open upload from consuming a permit for an hour while
+    # leaving the much longer generation deadline unchanged.
+    request_body_timeout_s: PositiveFloat = 120.0
 
     @model_validator(mode="after")
     def _check_port_range(self) -> "GenerationRouterConfig":
@@ -425,6 +453,29 @@ class GenerationRouterConfig(BaseModel, extra="allow"):
                 f"async_rl.generation_router.connect_timeout_s ({self.connect_timeout_s}) "
                 f"exceeds backend_timeout_s ({self.backend_timeout_s}), so the total "
                 "deadline would expire before the handshake one could ever fire."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_admission_limits(self) -> "GenerationRouterConfig":
+        if self.max_inflight_requests_per_backend > self.max_inflight_requests:
+            raise ValueError(
+                "async_rl.generation_router.max_inflight_requests_per_backend "
+                f"({self.max_inflight_requests_per_backend}) exceeds "
+                "max_inflight_requests "
+                f"({self.max_inflight_requests})."
+            )
+        if self.unknown_request_bytes > self.max_inflight_request_bytes:
+            raise ValueError(
+                "async_rl.generation_router.unknown_request_bytes "
+                f"({self.unknown_request_bytes}) exceeds max_inflight_request_bytes "
+                f"({self.max_inflight_request_bytes})."
+            )
+        if self.request_body_timeout_s > self.backend_timeout_s:
+            raise ValueError(
+                "async_rl.generation_router.request_body_timeout_s "
+                f"({self.request_body_timeout_s}) exceeds backend_timeout_s "
+                f"({self.backend_timeout_s})."
             )
         return self
 

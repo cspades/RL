@@ -125,6 +125,9 @@ PER_TOKEN_MULTIMODAL_FIELDS = frozenset(
     {
         "token_type_ids",  # gemma3: which tokens are image
         "mm_token_type_ids",  # qwen2.5-vl (transformers>=5.3): text(0)/image(1)/video(2) for 3D RoPE
+        # Exact message-owned media provenance. This is minted before message
+        # flattening and follows input_ids through padding, TQ, and packing.
+        "media_token_validity_mask",
     }
 )
 
@@ -1718,12 +1721,18 @@ def image_counts_by_row(batch: Any, num_rows: int) -> Optional[list[int]]:
 
 
 def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) -> None:
-    """Mark media tokens that anchor nothing, so the model keeps their embedding.
+    """Mark media tokens that do not anchor input media.
 
     Builds the mask while rows still are samples. Sequence packing later
     concatenates those rows into one THD sequence, after which no per-row
     question can be asked, so the packing step carries this through the same
     transform as ``input_ids`` rather than deriving it downstream.
+
+    ``token_mask`` is deliberately not used as media provenance. It is a loss
+    mask, and runs 7310230/7311217 proved that intersecting it with media-token
+    IDs can invalidate one complete 176-feature input-media block. Exact
+    message-owned provenance, when present, wins. The fallback only corrects the
+    unambiguous legacy case: media-token IDs in rows with no attached media.
 
     The batch is duck-typed rather than annotated as ``BatchedDataDict``:
     that module imports this one, so naming it here would be circular.
@@ -1733,9 +1742,28 @@ def attach_media_token_validity_mask(batch: Any, media_token_id: Optional[int]) 
     input_ids = batch.get("input_ids", None)
     if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
         return
+    existing_mask = batch.get("media_token_validity_mask", None)
+    if existing_mask is not None:
+        if not isinstance(existing_mask, torch.Tensor):
+            raise TypeError(
+                "media_token_validity_mask must be a torch.Tensor, got "
+                f"{type(existing_mask).__name__}."
+            )
+        if existing_mask.shape != input_ids.shape:
+            raise ValueError(
+                "media_token_validity_mask must align with input_ids: "
+                f"mask={tuple(existing_mask.shape)}, "
+                f"input_ids={tuple(input_ids.shape)}."
+            )
+        batch["media_token_validity_mask"] = existing_mask.bool()
+        return
     counts = image_counts_by_row(batch, input_ids.shape[0])
     if counts is None:
         return
-    mask = build_media_token_validity_mask(input_ids, media_token_id, counts)
+    mask = build_media_token_validity_mask(
+        input_ids,
+        media_token_id,
+        counts,
+    )
     if mask is not None:
         batch["media_token_validity_mask"] = mask

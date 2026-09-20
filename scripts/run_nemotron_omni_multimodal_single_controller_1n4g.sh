@@ -74,12 +74,15 @@ ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
 PREFIX_CACHING_MAMBA_GB="${PREFIX_CACHING_MAMBA_GB:-4}"
 PREFIX_CACHING_EVICTION_POLICY="${PREFIX_CACHING_EVICTION_POLICY:-lru}"
 PREFIX_CACHING_COORDINATOR_POLICY="${PREFIX_CACHING_COORDINATOR_POLICY:-longest_prefix}"
+# Adam moment dtypes accept fp32/bf16/fp8; fp8 is the uint8-backed TE FusedAdam
+# moment storage and saves ~2 bytes/param over bf16 on the 2-GPU train half.
 USE_PRECISION_AWARE_OPTIMIZER="${USE_PRECISION_AWARE_OPTIMIZER:-true}"
 EXP_AVG_DTYPE="${EXP_AVG_DTYPE:-bfloat16}"
 EXP_AVG_SQ_DTYPE="${EXP_AVG_SQ_DTYPE:-bfloat16}"
 STORE_PARAM_REMAINDERS="${STORE_PARAM_REMAINDERS:-true}"
 if [[ "${USE_PRECISION_AWARE_OPTIMIZER}" == "true" ]]; then
   OPTIMIZER_PRECISION_OVERRIDES=(
+    ++policy.megatron_cfg.optimizer.use_precision_aware_optimizer=true
     ++policy.megatron_cfg.optimizer.exp_avg_dtype="${EXP_AVG_DTYPE}"
     ++policy.megatron_cfg.optimizer.exp_avg_sq_dtype="${EXP_AVG_SQ_DTYPE}"
     ++policy.megatron_cfg.optimizer.store_param_remainders="${STORE_PARAM_REMAINDERS}"
@@ -92,6 +95,15 @@ else
     ++policy.megatron_cfg.optimizer.store_param_remainders=false
   )
 fi
+# Host OOM on GB200 when optimizer CPU offload is enabled for this model size,
+# so this stays off by default like the other 1n4g runners.
+OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-false}"
+if [[ "${OPTIMIZER_CPU_OFFLOAD}" == "true" ]]; then
+  OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
+else
+  OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-0.0}"
+fi
+OFFLOAD_OPTIMIZER_FOR_LOGPROB="${OFFLOAD_OPTIMIZER_FOR_LOGPROB:-false}"
 WANDB_ENABLED="${WANDB_ENABLED:-false}"
 MONITOR_GPUS="${MONITOR_GPUS:-${WANDB_ENABLED}}"
 GPU_MONITORING_COLLECTION_INTERVAL="${GPU_MONITORING_COLLECTION_INTERVAL:-10}"
@@ -266,8 +278,9 @@ COMMON_OVERRIDES=(
   policy.megatron_cfg.context_parallel_size="${POLICY_CP}"
   policy.megatron_cfg.sequence_parallel=true
   policy.megatron_cfg.bias_activation_fusion=false
-  policy.megatron_cfg.optimizer.optimizer_cpu_offload=false
-  policy.megatron_cfg.optimizer.optimizer_offload_fraction=0.0
+  policy.megatron_cfg.optimizer.optimizer_cpu_offload="${OPTIMIZER_CPU_OFFLOAD}"
+  policy.megatron_cfg.optimizer.optimizer_offload_fraction="${OPTIMIZER_OFFLOAD_FRACTION}"
+  policy.offload_optimizer_for_logprob="${OFFLOAD_OPTIMIZER_FOR_LOGPROB}"
   policy.megatron_cfg.distributed_data_parallel_config.overlap_param_gather=true
   policy.megatron_cfg.distributed_data_parallel_config.overlap_grad_reduce=true
   "${OPTIMIZER_PRECISION_OVERRIDES[@]}"
@@ -336,6 +349,8 @@ COMMON_OVERRIDES=(
 echo "Launching NeMo-RL v2 Omni ${TASK}: ${TRAIN_GPUS} train + ${GEN_GPUS} generation GPUs"
 echo "  SingleController async sampler: in_order, max lookahead ${MAX_LOOKAHEAD_VERSIONS}"
 echo "  Megatron generation: TP=${INFER_TP} EP=${INFER_EP}, refit=${REFIT_TRANSPORT}/${REFIT_BACKEND}, ${MEGATRON_TRANSFORMER_IMPL}, CG=${MEGATRON_CUDA_GRAPH_IMPL}, MoE padding=${MOE_PAD_EXPERTS_FOR_CG}, logging_interval=${MEGATRON_INFERENCE_LOGGING_STEP_INTERVAL}"
+echo "  optimizer: precision_aware=${USE_PRECISION_AWARE_OPTIMIZER} exp_avg=${EXP_AVG_DTYPE} exp_avg_sq=${EXP_AVG_SQ_DTYPE} store_param_remainders=${STORE_PARAM_REMAINDERS}"
+echo "  optimizer offload: cpu=${OPTIMIZER_CPU_OFFLOAD} fraction=${OPTIMIZER_OFFLOAD_FRACTION} for_logprob=${OFFLOAD_OPTIMIZER_FOR_LOGPROB}"
 echo "  GPU monitoring: enabled=${MONITOR_GPUS} collection=${GPU_MONITORING_COLLECTION_INTERVAL}s flush=${GPU_MONITORING_FLUSH_INTERVAL}s"
 
 exec env "${NSYS_ENV[@]}" uv run --no-sync python examples/run_grpo_single_controller.py \
