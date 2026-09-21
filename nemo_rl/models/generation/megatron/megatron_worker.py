@@ -488,6 +488,7 @@ class MegatronGenerationMixin:
         from megatron.core.inference.contexts.dynamic_context import (
             DynamicInferenceContext,
         )
+        from megatron.core.inference.config import MultimodalPromptConfig
         from megatron.core.inference.engines.dynamic_engine import (
             DynamicInferenceEngine,
         )
