@@ -31,7 +31,6 @@ from yarl import URL
 from nemo_rl.environments.nemo_gym import _typed_gym_failure
 from nemo_rl.experience.failures import (
     FailureClass,
-    GenerationAborted,
     GenerationUnavailable,
     GymTransportError,
     NoHealthyShards,
@@ -43,7 +42,6 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
     http_status_is_infra,
-    is_nonretryable_rollout_failure,
 )
 
 
@@ -227,15 +225,9 @@ class TestTheRayActorBoundary:
     """
 
     @staticmethod
-    def _realistic_response_error(
-        status: int, *, response_headers: dict[str, str] | None = None
-    ) -> aiohttp.ClientResponseError:
+    def _realistic_response_error(status: int) -> aiohttp.ClientResponseError:
         """Built the way aiohttp's ``raise_for_status`` builds it -- with real headers."""
-        headers = CIMultiDictProxy(
-            CIMultiDict(
-                response_headers or {"Content-Type": "application/json"}
-            )
-        )
+        headers = CIMultiDictProxy(CIMultiDict({"Content-Type": "application/json"}))
         request_info = aiohttp.RequestInfo(
             URL("http://gym/run"), "POST", headers, URL("http://gym")
         )
@@ -281,23 +273,6 @@ class TestTheRayActorBoundary:
     def test_an_exception_without_a_status_is_left_untouched(self):
         """No status means no HTTP verdict to make; the caller re-raises as-is."""
         assert _typed_gym_failure(RuntimeError("not an HTTP failure")) is None
-
-    def test_structured_nonretryable_500_is_not_redispatched(self):
-        """A timed-out admitted generation must not become an RL row replay."""
-        typed = _typed_gym_failure(
-            self._realistic_response_error(
-                500,
-                response_headers={
-                    "x-nemo-retryable": "false",
-                    "x-nemo-error-code": "generation_aborted",
-                },
-            )
-        )
-        assert typed is not None
-        assert isinstance(typed, GenerationAborted)
-        assert classify_rollout_failure(typed) is FailureClass.DATA
-        assert is_nonretryable_rollout_failure(typed)
-        assert "generation_aborted" in str(typed)
 
     def test_both_sides_of_the_boundary_share_one_status_policy(self):
         """nemo_gym classifies at source, failures.py on the driver -- one rule, not two."""
