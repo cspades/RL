@@ -4010,6 +4010,36 @@ class TestPromptExtraction:
             torch.tensor([False]),
         )
 
+    def test_grpo_preserves_processor_owned_media_validity(self):
+        """Processor provenance survives mixed-message GRPO mask construction."""
+        processor_mask = torch.tensor([False, True, True, False])
+        message_log = [
+            {
+                "role": "user",
+                "content": "",
+                "token_ids": torch.tensor([1, 7, 7, 2]),
+                "media_token_validity_mask": processor_mask,
+                "pixel_values": PackedTensor(
+                    torch.ones(1, 3, 2, 2), dim_to_pack=0
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor([7]),
+                "generation_logprobs": torch.tensor([0.1]),
+            },
+        ]
+
+        add_grpo_token_loss_masks_and_generation_logprobs([message_log])
+
+        torch.testing.assert_close(
+            message_log[0]["media_token_validity_mask"], processor_mask
+        )
+        torch.testing.assert_close(
+            message_log[1]["media_token_validity_mask"], torch.tensor([False])
+        )
+
     def test_grpo_loss_mask_uses_generation_logprobs_marker(self):
         """Test that only assistant messages with generation logprobs are trainable."""
         message_log = [

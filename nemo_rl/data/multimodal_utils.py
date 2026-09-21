@@ -1490,6 +1490,28 @@ def attach_image_model_inputs_to_message(
             if isinstance(value, PackedTensor)
         }
     )
+    attach_processor_media_token_validity_mask(message, processor)
+
+
+def attach_processor_media_token_validity_mask(
+    message: dict[str, Any], processor: Any
+) -> None:
+    """Record which rollout tokens are processor-owned media placeholders."""
+    token_ids = message.get("token_ids")
+    image_token = getattr(processor, "image_token", None)
+    tokenizer = getattr(processor, "tokenizer", None)
+    convert_token = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if (
+        not isinstance(token_ids, torch.Tensor)
+        or not isinstance(image_token, str)
+        or not callable(convert_token)
+    ):
+        return
+
+    media_token_id = convert_token(image_token)
+    if isinstance(media_token_id, bool) or not isinstance(media_token_id, int):
+        return
+    message["media_token_validity_mask"] = token_ids.eq(media_token_id)
 
 
 _VIDEO_EXT_TO_MIME = {

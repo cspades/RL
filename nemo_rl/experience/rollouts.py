@@ -293,7 +293,11 @@ def attach_static_multimodal_payload(
                 f"first_mismatch={first_mismatch}."
             )
         for key, value in source.items():
-            if isinstance(value, PackedTensor) or key in VLLM_PROMPT_KEYS:
+            if (
+                isinstance(value, PackedTensor)
+                or key in VLLM_PROMPT_KEYS
+                or key == "media_token_validity_mask"
+            ):
                 target[key] = value
 
 
