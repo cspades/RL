@@ -51,6 +51,7 @@ export MIN_GENERATION_TOKENS="${MIN_GENERATION_TOKENS:-4096}"
 export NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-2}"
 export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-2}"
 export TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))}"
+export DATA_SHUFFLE="${DATA_SHUFFLE:-true}"
 export MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-2}"
 export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-4}"
 export MAX_STEPS="${MAX_STEPS:-100000}"
@@ -93,7 +94,7 @@ exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh"
   ++policy.generation.mcore_generation_config.http_server_num_replicas="${HTTP_SERVER_NUM_REPLICAS}" \
   ++policy.generation.mcore_generation_config.image_dynamic_resolution=true \
   ++policy.generation.mcore_generation_config.video_maintain_aspect_ratio=false \
-  ++data.shuffle=true \
+  ++data.shuffle="${DATA_SHUFFLE}" \
   ++data.default.video_maintain_aspect_ratio=false \
   ++env.nemo_gym.config_paths="[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/mcqa/configs/mcqa.yaml,resources_servers/string_match/configs/string_match.yaml,resources_servers/sav_tracks/configs/sav_tracks.yaml]" \
   ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s="${NEMO_GYM_ROLLOUT_TIMEOUT_S}" \
