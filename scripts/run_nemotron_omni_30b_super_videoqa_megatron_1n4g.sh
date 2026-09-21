@@ -64,7 +64,6 @@ export OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-true}"
 export OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
 export OFFLOAD_OPTIMIZER_FOR_LOGPROB="${OFFLOAD_OPTIMIZER_FOR_LOGPROB:-true}"
 
-export ASYNC_RL_DIAGNOSTICS="${ASYNC_RL_DIAGNOSTICS:-true}"
 export WANDB_ENABLED="${WANDB_ENABLED:-false}"
 export MONITOR_GPUS="${MONITOR_GPUS:-true}"
 export MEGATRON_TRANSFORMER_IMPL="${MEGATRON_TRANSFORMER_IMPL:-inference_optimized}"
@@ -77,10 +76,6 @@ NEMO_GYM_ROLLOUT_TIMEOUT_S="${NEMO_GYM_ROLLOUT_TIMEOUT_S:-720}"
 GENERATION_ROUTER_BACKEND_TIMEOUT_S="${GENERATION_ROUTER_BACKEND_TIMEOUT_S:-600}"
 STALL_WATCHDOG_TIMEOUT_S="${STALL_WATCHDOG_TIMEOUT_S:-1200}"
 HTTP_SERVER_NUM_REPLICAS="${HTTP_SERVER_NUM_REPLICAS:-4}"
-MAX_CONCURRENT_GYM_ROWS="${MAX_CONCURRENT_GYM_ROWS:-4}"
-GENERATION_ROUTER_MAX_INFLIGHT="${GENERATION_ROUTER_MAX_INFLIGHT:-4}"
-GENERATION_ROUTER_MAX_INFLIGHT_PER_BACKEND="${GENERATION_ROUTER_MAX_INFLIGHT_PER_BACKEND:-4}"
-GENERATION_ROUTER_MAX_INFLIGHT_BYTES="${GENERATION_ROUTER_MAX_INFLIGHT_BYTES:-4294967296}"
 
 echo "Running Omni 30B Super VideoQA reproduction inside the current container"
 echo "  GPUs: 2 policy + 2 Megatron generation"
@@ -98,22 +93,10 @@ exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh"
   ++data.default.video_maintain_aspect_ratio=false \
   ++env.nemo_gym.config_paths="[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/mcqa/configs/mcqa.yaml,resources_servers/string_match/configs/string_match.yaml,resources_servers/sav_tracks/configs/sav_tracks.yaml]" \
   ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s="${NEMO_GYM_ROLLOUT_TIMEOUT_S}" \
-  ++async_rl.rollout_failure.nemo_gym.max_concurrent_rows="${MAX_CONCURRENT_GYM_ROWS}" \
-  ++async_rl.sampler.name=ready_first \
-  ++async_rl.sampler.max_staleness_versions=1 \
   ++async_rl.generation_router.enabled=true \
   ++async_rl.generation_router.backend_timeout_s="${GENERATION_ROUTER_BACKEND_TIMEOUT_S}" \
   ++async_rl.generation_router.connect_timeout_s=5 \
-  ++async_rl.generation_router.diagnostics_interval_s=30 \
-  ++async_rl.generation_router.admission_enabled=true \
-  ++async_rl.generation_router.max_inflight_requests="${GENERATION_ROUTER_MAX_INFLIGHT}" \
-  ++async_rl.generation_router.max_inflight_requests_per_backend="${GENERATION_ROUTER_MAX_INFLIGHT_PER_BACKEND}" \
-  ++async_rl.generation_router.max_inflight_request_bytes="${GENERATION_ROUTER_MAX_INFLIGHT_BYTES}" \
-  ++async_rl.generation_router.unknown_request_bytes=67108864 \
-  ++async_rl.generation_router.request_body_timeout_s=120 \
   ++async_rl.generation_fleet_health.enabled=false \
   ++async_rl.stall_watchdog.stall_timeout_s="${STALL_WATCHDOG_TIMEOUT_S}" \
   ++async_rl.stall_watchdog.stall_action=abort \
-  ++async_rl.stall_watchdog.gym_subprocess_check=false \
-  ++env.nemo_gym.initial_global_config_dict.global_aiohttp_client_request_debug=true \
   "$@"

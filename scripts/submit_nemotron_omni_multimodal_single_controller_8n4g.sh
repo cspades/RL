@@ -647,9 +647,6 @@ echo "  generation backend/TP/EP/world/DP: ${GENERATION_BACKEND}/${INFER_TP}/${I
 echo "  max model parallel GPUs / segment nodes: ${MAX_MODEL_PARALLEL_SIZE}/${SEGMENT_SIZE}"
 echo "  prompts/generations/train_gbs: ${NUM_PROMPTS_PER_STEP}/${NUM_GENERATIONS_PER_PROMPT}/${TRAIN_GBS}"
 echo "  async sampler/lookahead/inflight/buffer: in_order/${MAX_LOOKAHEAD_VERSIONS}/${MAX_INFLIGHT_PROMPTS}/${MAX_BUFFERED_ROLLOUTS}"
-if [[ -n "${MAX_CONCURRENT_GYM_ROWS:-}" ]]; then
-  echo "  NeMo-Gym physical row admission: ${MAX_CONCURRENT_GYM_ROWS}"
-fi
 echo "  sequence/inference-step/new tokens: ${MAX_SEQUENCE_LENGTH}/${INFERENCE_MAX_TOKENS}/${MAX_NEW_TOKENS}"
 if [[ "${GENERATION_BACKEND}" == "megatron" ]]; then
   echo "  generation: colocated=${COLOCATED} async=${ASYNC_GRPO} refit=${REFIT_TRANSPORT}/${REFIT_BACKEND}"

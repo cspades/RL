@@ -382,6 +382,18 @@ class MegatronGenerationMixin:
             image_kwargs["vision_model_type"] = str(
                 generation_config["vision_model_type"]
             )
+        if "image_dynamic_resolution_model_length" in generation_config:
+            image_kwargs["dynamic_resolution_model_length"] = int(
+                generation_config["image_dynamic_resolution_model_length"]
+            )
+        if "image_dynamic_resolution_rounding_mode" in generation_config:
+            image_kwargs["dynamic_resolution_rounding_mode"] = str(
+                generation_config["image_dynamic_resolution_rounding_mode"]
+            )
+        if "image_dynamic_resolution_resize_mode" in generation_config:
+            image_kwargs["dynamic_resolution_resize_mode"] = str(
+                generation_config["image_dynamic_resolution_resize_mode"]
+            )
         return build_image_preprocessing_config(
             processor.image_processor,
             **image_kwargs,

@@ -117,10 +117,6 @@ class RolloutDataFailure(RolloutFailure):
     """
 
 
-class GenerationAborted(RolloutDataFailure):
-    """An admitted generation was aborted and must never be replayed."""
-
-
 class RolloutRedispatchExhausted(RuntimeError):
     """A prompt exhausted its infrastructure retry budget.
 
@@ -266,17 +262,3 @@ def classify_rollout_failure(exc: BaseException) -> FailureClass:
         current = current.__cause__
 
     return FailureClass.DATA
-
-
-def is_nonretryable_rollout_failure(exc: BaseException) -> bool:
-    """Return whether an exception chain contains a terminal rollout failure."""
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    for _ in range(_MAX_CAUSE_DEPTH):
-        if current is None or id(current) in seen:
-            break
-        seen.add(id(current))
-        if isinstance(current, GenerationAborted):
-            return True
-        current = current.__cause__
-    return False
