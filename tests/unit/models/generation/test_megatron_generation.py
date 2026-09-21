@@ -504,9 +504,19 @@ def test_multimodal_preprocessing_forwards_vision_model_type():
         )
     )
 
-    config = worker._build_image_preprocessing_config({"vision_model_type": "qwen-vl"})
+    config = worker._build_image_preprocessing_config(
+        {
+            "vision_model_type": "qwen-vl",
+            "image_dynamic_resolution_model_length": 16384,
+            "image_dynamic_resolution_rounding_mode": "round_plus_half",
+            "image_dynamic_resolution_resize_mode": "torch_bicubic_antialias",
+        }
+    )
 
     assert config.vision_model_type == "qwen-vl"
+    assert config.dynamic_resolution_model_length == 16384
+    assert config.dynamic_resolution_rounding_mode == "round_plus_half"
+    assert config.dynamic_resolution_resize_mode == "torch_bicubic_antialias"
 
 
 @pytest.mark.mcore

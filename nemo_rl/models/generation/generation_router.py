@@ -47,8 +47,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
-from collections.abc import Callable
 from typing import Any, Optional
 
 import ray
@@ -62,160 +60,6 @@ _SKIPPED_RESPONSE_HEADERS = frozenset(
 # Body chunk size for the streaming pass-through. Large enough that a long completion
 # does not cost thousands of iterations, small enough not to buffer a whole response.
 _STREAM_CHUNK_BYTES = 64 * 1024
-_BACKEND_DEADLINE_HEADER = "X-Megatron-Request-Timeout-Seconds"
-_ROUTER_TRACE_HEADER = "X-Nemo-Router-Request-Id"
-_RETRYABLE_HEADER = "X-Nemo-Retryable"
-_ERROR_CODE_HEADER = "X-Nemo-Error-Code"
-_GENERATION_ABORTED_ERROR_CODE = "generation_aborted"
-_REQUEST_BODY_TIMEOUT_ERROR_CODE = "request_body_timeout"
-_ROUTER_ADMISSION_TIMEOUT_ERROR_CODE = "router_admission_timeout"
-_ADMISSION_BACKEND = "<waiting>"
-
-
-def _alphabetic_tag(value: int) -> str:
-    """Return a compact letters-only counter that Ray log dedup cannot normalize."""
-    value = int(value)
-    chars = []
-    while True:
-        value, remainder = divmod(value, 26)
-        chars.append(chr(ord("a") + remainder))
-        if value == 0:
-            return "".join(reversed(chars))
-        value -= 1
-
-
-class _AdmissionLease:
-    """One router admission, released exactly once across cancellation paths."""
-
-    def __init__(
-        self,
-        manager: "_RouterAdmission",
-        backend: str,
-        reserved_bytes: int,
-    ) -> None:
-        self._manager = manager
-        self.backend = backend
-        self.reserved_bytes = reserved_bytes
-        self._bytes_released = False
-        self._request_released = False
-
-    async def grow_bytes(self, additional_bytes: int) -> None:
-        """Reserve bytes not covered by an unknown-length request's estimate."""
-        if additional_bytes <= 0 or self._bytes_released:
-            return
-        await self._manager.grow_bytes(additional_bytes)
-        self.reserved_bytes += additional_bytes
-
-    async def release_body_bytes(self) -> None:
-        """Release the byte budget once request-body forwarding reaches EOF."""
-        if self._bytes_released:
-            return
-        self._bytes_released = True
-        await self._manager.release_bytes(self.reserved_bytes)
-
-    async def release(self) -> None:
-        """Release request/backend capacity and any remaining byte reservation."""
-        if self._request_released:
-            return
-        self._request_released = True
-        bytes_to_release = 0 if self._bytes_released else self.reserved_bytes
-        self._bytes_released = True
-        await self._manager.release_request(self.backend, bytes_to_release)
-
-
-class _RouterAdmission:
-    """Atomic count- and byte-weighted admission for router forwarding."""
-
-    def __init__(
-        self,
-        *,
-        backends: list[str],
-        max_requests: int,
-        max_requests_per_backend: int,
-        max_bytes: int,
-    ) -> None:
-        self._max_requests = max_requests
-        self._max_requests_per_backend = max_requests_per_backend
-        self._max_bytes = max_bytes
-        self._requests = 0
-        self._bytes = 0
-        self._waiters = 0
-        self._requests_by_backend = {backend: 0 for backend in backends}
-        self._condition = asyncio.Condition()
-
-    async def acquire(
-        self,
-        serving_backends: Callable[[], list[str]],
-        reserved_bytes: int,
-    ) -> _AdmissionLease:
-        """Wait for all limits, then atomically reserve a least-loaded backend."""
-        async with self._condition:
-            self._waiters += 1
-            try:
-                while True:
-                    eligible = [
-                        backend
-                        for backend in serving_backends()
-                        if self._requests_by_backend[backend]
-                        < self._max_requests_per_backend
-                    ]
-                    if (
-                        eligible
-                        and self._requests < self._max_requests
-                        and self._bytes + reserved_bytes <= self._max_bytes
-                    ):
-                        backend = min(
-                            eligible,
-                            key=lambda url: (self._requests_by_backend[url], url),
-                        )
-                        self._requests += 1
-                        self._bytes += reserved_bytes
-                        self._requests_by_backend[backend] += 1
-                        return _AdmissionLease(self, backend, reserved_bytes)
-
-                    # Membership updates arrive on the Ray actor thread and cannot
-                    # notify this event-loop condition directly. A bounded wake makes
-                    # a newly healthy backend visible without cross-thread operations.
-                    try:
-                        await asyncio.wait_for(self._condition.wait(), timeout=1.0)
-                    except TimeoutError:
-                        pass
-            finally:
-                self._waiters -= 1
-
-    async def grow_bytes(self, additional_bytes: int) -> None:
-        """Extend an unknown-length request's reservation without oversubscription."""
-        async with self._condition:
-            while self._bytes + additional_bytes > self._max_bytes:
-                await self._condition.wait()
-            self._bytes += additional_bytes
-
-    async def release_bytes(self, reserved_bytes: int) -> None:
-        async with self._condition:
-            self._bytes = max(0, self._bytes - reserved_bytes)
-            self._condition.notify_all()
-
-    async def release_request(self, backend: str, reserved_bytes: int) -> None:
-        async with self._condition:
-            self._requests = max(0, self._requests - 1)
-            self._bytes = max(0, self._bytes - reserved_bytes)
-            self._requests_by_backend[backend] = max(
-                0, self._requests_by_backend[backend] - 1
-            )
-            self._condition.notify_all()
-
-    def snapshot(self) -> dict[str, Any]:
-        """Return approximate live counters for cross-thread diagnostics."""
-        return {
-            "enabled": True,
-            "requests": self._requests,
-            "waiters": self._waiters,
-            "max_requests": self._max_requests,
-            "bytes": self._bytes,
-            "max_bytes": self._max_bytes,
-            "requests_by_backend": dict(self._requests_by_backend),
-            "max_requests_per_backend": self._max_requests_per_backend,
-        }
 
 
 class GenerationRouterImpl:
@@ -231,25 +75,9 @@ class GenerationRouterImpl:
         connect_timeout_s: float,
         no_healthy_backend_status: int,
         health_managed: bool = False,
-        diagnostics_interval_s: Optional[float] = 30.0,
-        admission_enabled: bool = False,
-        max_inflight_requests: int = 128,
-        max_inflight_requests_per_backend: int = 8,
-        max_inflight_request_bytes: int = 4 * 1024**3,
-        unknown_request_bytes: int = 64 * 1024**2,
-        request_body_timeout_s: float = 120.0,
     ) -> None:
         if not backend_urls:
             raise ValueError("GenerationRouter requires at least one backend URL")
-        if max_inflight_requests_per_backend > max_inflight_requests:
-            raise ValueError(
-                "max_inflight_requests_per_backend cannot exceed "
-                "max_inflight_requests"
-            )
-        if unknown_request_bytes > max_inflight_request_bytes:
-            raise ValueError(
-                "unknown_request_bytes cannot exceed max_inflight_request_bytes"
-            )
         self._all_backends = list(backend_urls)
         # Starts as every backend: a restarted router has no health history, and routing
         # to a shard that turns out to be dead is self-correcting on the next push.
@@ -276,34 +104,6 @@ class GenerationRouterImpl:
         self._requests_total = 0
         self._no_backend_total = 0
         self._backend_error_total = 0
-        self._responses_total = 0
-        self._last_request_at: Optional[float] = None
-        self._last_response_at: Optional[float] = None
-        self._next_flow_request_id = 0
-        # backend, path, request start, current phase, phase start. Keeping the phase
-        # here distinguishes requests that have not received backend headers (frontend
-        # queue/admission/generation) from replies whose bodies are stuck in transport.
-        self._active_requests: dict[int, tuple[str, str, float, str, float]] = {}
-        # The aiohttp loop runs on a daemon thread while Ray invokes metrics() on the
-        # actor thread. Keep snapshots coherent instead of iterating a mutating dict.
-        self._flow_lock = threading.Lock()
-        self._diagnostics_interval_s = diagnostics_interval_s
-        self._unknown_request_bytes = unknown_request_bytes
-        self._request_body_timeout_s = request_body_timeout_s
-        self._max_inflight_requests = max_inflight_requests
-        self._max_inflight_requests_per_backend = (
-            max_inflight_requests_per_backend
-        )
-        self._admission = (
-            _RouterAdmission(
-                backends=backend_urls,
-                max_requests=max_inflight_requests,
-                max_requests_per_backend=max_inflight_requests_per_backend,
-                max_bytes=max_inflight_request_bytes,
-            )
-            if admission_enabled
-            else None
-        )
         self._thread: Optional[threading.Thread] = None
         self._socket: Any = None
 
@@ -373,144 +173,12 @@ class GenerationRouterImpl:
         return outcomes
 
     def metrics(self) -> dict[str, float]:
-        snapshot = self.diagnostics()
         return {
-            "router/requests_total": float(snapshot["requests_total"]),
-            "router/responses_total": float(snapshot["responses_total"]),
-            "router/no_healthy_backend_total": float(snapshot["no_backend_total"]),
-            "router/backend_error_total": float(snapshot["backend_error_total"]),
-            "router/serving_backends": float(snapshot["serving_backends"]),
-            "router/inflight_requests": float(snapshot["inflight_requests"]),
-            "router/oldest_inflight_seconds": float(
-                snapshot["oldest_inflight_seconds"]
-            ),
-            "router/seconds_since_last_request": float(
-                snapshot["seconds_since_last_request"]
-            ),
-            "router/seconds_since_last_response": float(
-                snapshot["seconds_since_last_response"]
-            ),
-            "router/admitted_requests": float(snapshot["admission"]["requests"]),
-            "router/admission_waiters": float(snapshot["admission"]["waiters"]),
-            "router/admitted_request_bytes": float(snapshot["admission"]["bytes"]),
+            "router/requests_total": float(self._requests_total),
+            "router/no_healthy_backend_total": float(self._no_backend_total),
+            "router/backend_error_total": float(self._backend_error_total),
+            "router/serving_backends": float(len(self._serving)),
         }
-
-    def diagnostics(self) -> dict[str, Any]:
-        """Return a coherent request-flow snapshot for watchdogs and heartbeats."""
-        now = time.monotonic()
-        with self._flow_lock:
-            active = list(self._active_requests.values())
-            active_by_backend = {
-                backend: sum(
-                    1
-                    for active_backend, _, _, _, _ in active
-                    if active_backend == backend
-                )
-                for backend in self._all_backends
-            }
-            oldest_by_backend = {
-                backend: max(
-                    (
-                        now - started
-                        for active_backend, _, started, _, _ in active
-                        if active_backend == backend
-                    ),
-                    default=0.0,
-                )
-                for backend in self._all_backends
-            }
-            active_by_phase: dict[str, int] = {}
-            for _, _, _, phase, _ in active:
-                active_by_phase[phase] = active_by_phase.get(phase, 0) + 1
-            oldest_requests = sorted(
-                (
-                    {
-                        "backend": backend,
-                        "path": path,
-                        "age_seconds": now - started,
-                        "phase": phase,
-                        "phase_age_seconds": now - phase_started,
-                    }
-                    for backend, path, started, phase, phase_started in active
-                ),
-                key=lambda item: item["age_seconds"],
-                reverse=True,
-            )[:5]
-            snapshot = {
-                "requests_total": self._requests_total,
-                "responses_total": self._responses_total,
-                "no_backend_total": self._no_backend_total,
-                "backend_error_total": self._backend_error_total,
-                "serving_backends": len(self._serving),
-                "inflight_requests": len(active),
-                "oldest_inflight_seconds": (
-                    oldest_requests[0]["age_seconds"] if oldest_requests else 0.0
-                ),
-                "seconds_since_last_request": (
-                    now - self._last_request_at
-                    if self._last_request_at is not None
-                    else -1.0
-                ),
-                "seconds_since_last_response": (
-                    now - self._last_response_at
-                    if self._last_response_at is not None
-                    else -1.0
-                ),
-                "active_by_backend": active_by_backend,
-                "oldest_by_backend": oldest_by_backend,
-                "active_by_phase": active_by_phase,
-                "oldest_requests": oldest_requests,
-            }
-        snapshot["admission"] = (
-            self._admission.snapshot()
-            if self._admission is not None
-            else {
-                "enabled": False,
-                "requests": 0,
-                "waiters": 0,
-                "max_requests": 0,
-                "bytes": 0,
-                "max_bytes": 0,
-                "requests_by_backend": {},
-                "max_requests_per_backend": 0,
-            }
-        )
-        return snapshot
-
-    def _set_request_phase(self, flow_request_id: int, phase: str) -> None:
-        """Advance one router request's lifecycle phase for live diagnostics."""
-        with self._flow_lock:
-            active = self._active_requests.get(flow_request_id)
-            if active is None:
-                return
-            backend, path, started, _, _ = active
-            self._active_requests[flow_request_id] = (
-                backend,
-                path,
-                started,
-                phase,
-                time.monotonic(),
-            )
-
-    def _set_request_backend(self, flow_request_id: int, backend: str) -> None:
-        """Assign the backend chosen atomically by the admission controller."""
-        with self._flow_lock:
-            active = self._active_requests.get(flow_request_id)
-            if active is None:
-                return
-            _, path, started, phase, phase_started = active
-            self._active_requests[flow_request_id] = (
-                backend,
-                path,
-                started,
-                phase,
-                phase_started,
-            )
-
-    def _request_phase(self, flow_request_id: int) -> str:
-        with self._flow_lock:
-            active = self._active_requests.get(flow_request_id)
-            return active[3] if active is not None else "unknown"
 
     def _pick_backend(self) -> Optional[str]:
         """Least-outstanding among eligible backends, or None if there are none."""
@@ -533,29 +201,10 @@ class GenerationRouterImpl:
     async def _handle(self, request: Any) -> Any:
         from aiohttp import ClientError, web
 
-        now = time.monotonic()
-        with self._flow_lock:
-            self._requests_total += 1
-            self._last_request_at = now
-            flow_request_id = self._next_flow_request_id
-            self._next_flow_request_id += 1
-            self._active_requests[flow_request_id] = (
-                _ADMISSION_BACKEND,
-                request.rel_url.path,
-                now,
-                (
-                    "waiting_for_router_admission"
-                    if self._admission is not None
-                    else "forward_start"
-                ),
-                now,
-            )
-        if not self._serving:
-            with self._flow_lock:
-                self._active_requests.pop(flow_request_id, None)
-                self._no_backend_total += 1
-                self._responses_total += 1
-                self._last_response_at = time.monotonic()
+        self._requests_total += 1
+        backend = self._pick_backend()
+        if backend is None:
+            self._no_backend_total += 1
             # The status matters: NeMo-Gym retries 429/500/502/503/504/520, and for the
             # rate-limit codes it *raises its own retry ceiling* each time, so returning
             # one of those would spin forever. This code must stay outside that set.
@@ -567,103 +216,15 @@ class GenerationRouterImpl:
                 status=self._no_healthy_backend_status,
             )
 
-        content_length = request.content_length
-        reserved_bytes = (
-            content_length if content_length is not None else self._unknown_request_bytes
-        )
-        admission_snapshot = (
-            self._admission.snapshot() if self._admission is not None else None
-        )
-        if (
-            admission_snapshot is not None
-            and reserved_bytes > admission_snapshot["max_bytes"]
-        ):
-            with self._flow_lock:
-                self._active_requests.pop(flow_request_id, None)
-                self._responses_total += 1
-                self._last_response_at = time.monotonic()
-            return web.json_response(
-                {
-                    "error": {
-                        "message": (
-                            f"request body reservation {reserved_bytes} exceeds router "
-                            f"byte budget {admission_snapshot['max_bytes']}"
-                        ),
-                        "type": "RequestEntityTooLarge",
-                        "retryable": False,
-                    }
-                },
-                status=413,
-                headers={_RETRYABLE_HEADER: "false"},
-            )
-
-        lease: Optional[_AdmissionLease] = None
-        backend = _ADMISSION_BACKEND
-        outcome = "cancelled"
+        self._inflight[backend] = self._inflight.get(backend, 0) + 1
         try:
-            if self._admission is not None:
-                async with asyncio.timeout(self._request_body_timeout_s):
-                    lease = await self._admission.acquire(
-                        lambda: self._serving, reserved_bytes
-                    )
-                backend = lease.backend
-            else:
-                selected_backend = self._pick_backend()
-                if selected_backend is None:
-                    raise RuntimeError("serving backend set became empty during routing")
-                backend = selected_backend
-            self._set_request_backend(flow_request_id, backend)
-            self._set_request_phase(flow_request_id, "forward_start")
-            with self._flow_lock:
-                self._inflight[backend] = self._inflight.get(backend, 0) + 1
-            response = await self._forward(
-                request, backend, flow_request_id, now, lease
-            )
-            outcome = f"http-{response.status}"
-            return response
+            return await self._forward(request, backend)
         except (TimeoutError, ClientError) as error:
-            outcome = type(error).__name__
-            return self._on_backend_error(
-                backend,
-                error,
-                elapsed_seconds=time.monotonic() - now,
-                request_phase=self._request_phase(flow_request_id),
-            )
+            return self._on_backend_error(backend, error)
         finally:
-            if lease is not None:
-                await lease.release()
-            finished_at = time.monotonic()
-            elapsed = finished_at - now
-            with self._flow_lock:
-                self._active_requests.pop(flow_request_id, None)
-                if backend != _ADMISSION_BACKEND:
-                    self._inflight[backend] = max(
-                        0, self._inflight.get(backend, 0) - 1
-                    )
-                self._responses_total += 1
-                self._last_response_at = finished_at
-            if elapsed >= 60.0 or outcome != "http-200":
-                backend_name = (
-                    f"b{self._all_backends.index(backend)}"
-                    if backend in self._all_backends
-                    else backend
-                )
-                print(
-                    "policy router request done: "
-                    f"tag={_alphabetic_tag(flow_request_id)} id={flow_request_id} "
-                    f"backend={backend_name} path={request.rel_url.path} "
-                    f"elapsed={elapsed:.1f}s outcome={outcome}",
-                    flush=True,
-                )
+            self._inflight[backend] = max(0, self._inflight.get(backend, 0) - 1)
 
-    def _on_backend_error(
-        self,
-        backend: str,
-        error: BaseException,
-        *,
-        elapsed_seconds: float,
-        request_phase: str = "unknown",
-    ) -> Any:
+    def _on_backend_error(self, backend: str, error: BaseException) -> Any:
         """Answer for a backend that failed, deliberately rather than by accident.
 
         Without this, aiohttp answers instead, and its choice of status decides whether
@@ -682,107 +243,32 @@ class GenerationRouterImpl:
         """
         from aiohttp import web
 
-        with self._flow_lock:
-            self._backend_error_total += 1
-        pre_submit_failure = request_phase in {
-            "waiting_for_router_admission",
-            "streaming_request_body",
-        }
-        if not pre_submit_failure:
-            self._backend_failures[backend] = (
-                self._backend_failures.get(backend, 0) + 1
-            )
+        self._backend_error_total += 1
+        self._backend_failures[backend] = self._backend_failures.get(backend, 0) + 1
         # The transport cause, logged here because nothing else keeps it. It goes into
         # the response body, which is Gym's to interpret, and the ledger only ever sees
         # the aggregated "N failed request(s)" summary -- so without this line a
         # condemned shard's record cannot say whether it refused connections, reset them,
         # or timed out, which are three different problems.
-        if isinstance(error, TimeoutError):
-            print(
-                "POLICY ROUTER BACKEND TIMEOUT: "
-                f"backend={backend} phase={request_phase} "
-                f"elapsed_s={elapsed_seconds:.3f} "
-                f"configured_timeout_s={self._backend_timeout_s:.3f} "
-                "classification=local_deadline_exceeded "
-                "backend_exception_observed=false",
-                flush=True,
-            )
-        else:
-            print(
-                "POLICY ROUTER BACKEND TRANSPORT ERROR: "
-                f"backend={backend} phase={request_phase} "
-                f"elapsed_s={elapsed_seconds:.3f} "
-                f"error_type={type(error).__name__} error={error!r}",
-                flush=True,
-            )
-        if self._health_managed and not pre_submit_failure:
+        print(
+            f"policy router: backend {backend} failed: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        if self._health_managed:
             # Reflex: stop routing here until the next membership push re-adds it.
             # Rebound, not mutated -- same reason as set_serving_backends, and this runs
             # on the server thread while pushes arrive on the actor's.
             self._serving = [url for url in self._serving if url != backend]
         status = 500 if self._serving else self._no_healthy_backend_status
-        error_payload: dict[str, Any] = {
-            "message": f"router/backend failed: {type(error).__name__}: {error}",
-            "type": type(error).__name__,
-            "retryable": True,
-        }
-        response_headers = None
-        is_connect_failure = type(error).__name__ in {
-            "ClientConnectorError",
-            "ConnectionTimeoutError",
-        } or (
-            isinstance(error, TimeoutError)
-            and request_phase == "forward_start"
-            and elapsed_seconds <= self._connect_timeout_s + 1.0
-        )
-        if isinstance(error, TimeoutError) and not is_connect_failure:
-            if pre_submit_failure:
-                # The frontend cannot parse or admit incomplete JSON, and an admission
-                # waiter has not opened a backend request at all. Both are safe to retry
-                # after bounded backoff and must not quarantine a backend.
-                error_code = (
-                    _ROUTER_ADMISSION_TIMEOUT_ERROR_CODE
-                    if request_phase == "waiting_for_router_admission"
-                    else _REQUEST_BODY_TIMEOUT_ERROR_CODE
-                )
-                error_payload.update(
-                    code=error_code,
-                    retryable=True,
-                )
-                response_headers = {
-                    _RETRYABLE_HEADER: "true",
-                    _ERROR_CODE_HEADER: error_code,
-                }
-            else:
-                # A timed-out generation may already have been admitted. Retrying it
-                # here creates duplicate engine work; the frontend deadline normally
-                # aborts it first. Structured transport metadata is the fallback
-                # against retry amplification if that response misses this proxy.
-                error_payload.update(
-                    code=_GENERATION_ABORTED_ERROR_CODE,
-                    retryable=False,
-                )
-                response_headers = {
-                    _RETRYABLE_HEADER: "false",
-                    _ERROR_CODE_HEADER: _GENERATION_ABORTED_ERROR_CODE,
-                }
         return web.json_response(
             {
-                "error": error_payload,
+                "error": f"backend failed: {type(error).__name__}: {error}",
                 "backend": backend,
             },
             status=status,
-            headers=response_headers,
         )
 
-    async def _forward(
-        self,
-        request: Any,
-        backend: str,
-        flow_request_id: int,
-        started_at: float,
-        admission_lease: Optional[_AdmissionLease],
-    ) -> Any:
+    async def _forward(self, request: Any, backend: str) -> Any:
         from aiohttp import ClientTimeout, web
 
         session = request.app["session"]
@@ -791,47 +277,12 @@ class GenerationRouterImpl:
             for key, value in request.headers.items()
             if key.lower() not in _SKIPPED_REQUEST_HEADERS
         }
-        # Expire inside the inference frontend first, while this connection is
-        # alive, so it can send ABORT_REQUEST to the coordinator. Closing only
-        # this proxy hop leaves an orphan generation consuming engine capacity.
-        frontend_budget_s = max(
-            1.0,
-            self._backend_timeout_s - (time.monotonic() - started_at) - 5.0,
-        )
-        headers[_BACKEND_DEADLINE_HEADER] = f"{frontend_budget_s:.3f}"
-        headers[_ROUTER_TRACE_HEADER] = str(flow_request_id)
-
-        request_body_bytes = 0
-
-        async def _request_body():
-            nonlocal request_body_bytes
-            self._set_request_phase(flow_request_id, "streaming_request_body")
-            async with asyncio.timeout(self._request_body_timeout_s):
-                async for chunk in request.content.iter_chunked(_STREAM_CHUNK_BYTES):
-                    request_body_bytes += len(chunk)
-                    if admission_lease is not None:
-                        unreserved_bytes = (
-                            request_body_bytes - admission_lease.reserved_bytes
-                        )
-                        if unreserved_bytes > 0:
-                            await admission_lease.grow_bytes(unreserved_bytes)
-                    yield chunk
-            if admission_lease is not None:
-                await admission_lease.release_body_bytes()
-            self._set_request_phase(flow_request_id, "awaiting_headers")
-            print(
-                "policy router request body sent: "
-                f"tag={_alphabetic_tag(flow_request_id)} id={flow_request_id} "
-                f"backend={backend} bytes={request_body_bytes} "
-                f"elapsed={time.monotonic() - started_at:.3f}s",
-                flush=True,
-            )
 
         async with session.request(
             method=request.method,
             url=self._target_url(backend, request.rel_url.path_qs),
             headers=headers,
-            data=_request_body(),
+            data=request.content,
             # The timeout Gym's own client never sets. Without it a wedged backend holds
             # this request, and the rollout behind it, indefinitely.
             #
@@ -846,26 +297,6 @@ class GenerationRouterImpl:
                 total=self._backend_timeout_s, sock_connect=self._connect_timeout_s
             ),
         ) as upstream:
-            headers_at = time.monotonic()
-            self._set_request_phase(flow_request_id, "streaming_body")
-            print(
-                "policy router upstream headers: "
-                f"tag={_alphabetic_tag(flow_request_id)} id={flow_request_id} "
-                f"backend={backend} status={upstream.status} "
-                f"request_bytes={request_body_bytes} "
-                f"headers_after={headers_at - started_at:.3f}s",
-                flush=True,
-            )
-            if upstream.status >= 500:
-                print(
-                    "POLICY ROUTER BACKEND HTTP ERROR RESPONSE: "
-                    f"tag={_alphabetic_tag(flow_request_id)} id={flow_request_id} "
-                    f"backend={backend} status={upstream.status} "
-                    f"elapsed_s={headers_at - started_at:.3f} "
-                    f"error_code={upstream.headers.get(_ERROR_CODE_HEADER, 'unspecified')} "
-                    f"retryable={upstream.headers.get(_RETRYABLE_HEADER, 'unspecified')}",
-                    flush=True,
-                )
             response = web.StreamResponse(
                 status=upstream.status,
                 headers={
@@ -874,38 +305,12 @@ class GenerationRouterImpl:
                     if key.lower() not in _SKIPPED_RESPONSE_HEADERS
                 },
             )
-            prepare_started_at = time.monotonic()
             await response.prepare(request)
-            prepared_at = time.monotonic()
-            self._set_request_phase(flow_request_id, "relaying_response_body")
-            print(
-                "policy router downstream headers sent: "
-                f"tag={_alphabetic_tag(flow_request_id)} id={flow_request_id} "
-                f"backend={backend} prepare_ms={(prepared_at - prepare_started_at) * 1000:.1f} "
-                f"elapsed={prepared_at - started_at:.3f}s",
-                flush=True,
-            )
             # Streamed rather than buffered: a completion carrying per-token logprobs is
             # large, and this sits on every rollout's critical path.
-            response_body_bytes = 0
-            response_chunks = 0
             async for chunk in upstream.content.iter_chunked(_STREAM_CHUNK_BYTES):
-                response_body_bytes += len(chunk)
-                response_chunks += 1
                 await response.write(chunk)
-            self._set_request_phase(flow_request_id, "write_eof")
-            eof_started_at = time.monotonic()
             await response.write_eof()
-            finished_at = time.monotonic()
-            print(
-                "policy router response relayed: "
-                f"tag={_alphabetic_tag(flow_request_id)} id={flow_request_id} "
-                f"backend={backend} chunks={response_chunks} bytes={response_body_bytes} "
-                f"body_ms={(eof_started_at - prepared_at) * 1000:.1f} "
-                f"eof_ms={(finished_at - eof_started_at) * 1000:.1f} "
-                f"total_ms={(finished_at - started_at) * 1000:.1f}",
-                flush=True,
-            )
             # After write_eof, so it means "served a whole response" rather than "accepted
             # the request".
             self._backend_successes[backend] = (
@@ -920,24 +325,14 @@ class GenerationRouterImpl:
         app = web.Application()
 
         async def _open_session(app_: Any) -> None:
-            # Explicit admission above this connector owns normal queueing and exposes
-            # its phase. Matching connector limits are a defensive invariant: a future
-            # call site cannot silently bypass admission and recreate an unbounded
-            # multi-gigabyte upload fan-out.
-            app_["session"] = ClientSession(
-                connector=TCPConnector(
-                    limit=(
-                        self._max_inflight_requests
-                        if self._admission is not None
-                        else 0
-                    ),
-                    limit_per_host=(
-                        self._max_inflight_requests_per_backend
-                        if self._admission is not None
-                        else 0
-                    ),
-                )
-            )
+            # Explicit connector: aiohttp's default is TCPConnector(limit=100), which
+            # would cap the whole fleet's rollout traffic at 100 concurrent upstream
+            # requests -- the exemplar config alone puts 32 prompts x 16 generations =
+            # 512 in flight. Requests over the cap queue *inside this connector*, where
+            # the wait silently burns the total timeout before the backend ever sees
+            # them. Unlimited here sends the excess to vLLM's scheduler instead, where
+            # queueing is visible as engine metrics rather than proxy latency.
+            app_["session"] = ClientSession(connector=TCPConnector(limit=0))
 
         async def _close_session(app_: Any) -> None:
             await app_["session"].close()
@@ -959,58 +354,6 @@ class GenerationRouterImpl:
             app.router.add_route("*", path, self._handle)
         app.router.add_route("*", "/tokenize", self._handle)
         return app
-
-    async def _diagnostic_heartbeat(self) -> None:
-        """Print centralized request flow even when every downstream log is quiet."""
-        assert self._diagnostics_interval_s is not None
-        previous_requests = 0
-        previous_responses = 0
-        heartbeat_index = 0
-        while True:
-            await asyncio.sleep(self._diagnostics_interval_s)
-            snapshot = self.diagnostics()
-            requests = int(snapshot["requests_total"])
-            responses = int(snapshot["responses_total"])
-            active = [
-                (
-                    index,
-                    int(snapshot["active_by_backend"][backend]),
-                    float(snapshot["oldest_by_backend"][backend]),
-                )
-                for index, backend in enumerate(self._all_backends)
-                if snapshot["active_by_backend"][backend]
-            ]
-            active_text = (
-                ",".join(
-                    f"b{index}:{count}@{oldest:.0f}s" for index, count, oldest in active
-                )
-                or "none"
-            )
-            print(
-                "policy router heartbeat: "
-                f"tag={_alphabetic_tag(heartbeat_index)} "
-                f"requests={requests} (+{requests - previous_requests}) "
-                f"responses={responses} (+{responses - previous_responses}) "
-                f"inflight={snapshot['inflight_requests']} "
-                f"oldest={snapshot['oldest_inflight_seconds']:.0f}s "
-                f"request_idle={snapshot['seconds_since_last_request']:.0f}s "
-                f"response_idle={snapshot['seconds_since_last_response']:.0f}s "
-                f"serving={snapshot['serving_backends']}/{len(self._all_backends)} "
-                f"admitted={snapshot['admission']['requests']}/"
-                f"{snapshot['admission']['max_requests']} "
-                f"admission_waiters={snapshot['admission']['waiters']} "
-                f"admitted_bytes={snapshot['admission']['bytes']}/"
-                f"{snapshot['admission']['max_bytes']} "
-                f"admitted_by_backend="
-                f"{snapshot['admission']['requests_by_backend']} "
-                f"phases={snapshot['active_by_phase']} "
-                f"active=[{active_text}] "
-                f"oldest_requests={snapshot['oldest_requests']}",
-                flush=True,
-            )
-            heartbeat_index += 1
-            previous_requests = requests
-            previous_responses = responses
 
     def serve_in_background(self) -> None:
         """Run the HTTP server on a daemon thread with its own event loop.
@@ -1045,8 +388,6 @@ class GenerationRouterImpl:
             site = web.SockSite(runner, sock)
             loop.run_until_complete(site.start())
             print(f"policy router listening on {self.base_url()}", flush=True)
-            if self._diagnostics_interval_s is not None:
-                loop.create_task(self._diagnostic_heartbeat())
             loop.run_forever()
 
         self._thread = threading.Thread(target=_run, name="policy-router", daemon=True)

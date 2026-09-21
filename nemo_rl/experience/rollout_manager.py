@@ -19,7 +19,6 @@ import copy
 import enum
 import json
 import math
-import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -53,7 +52,6 @@ from nemo_rl.experience.failures import (
     RolloutRedispatchExhausted,
     RolloutTimeout,
     classify_rollout_failure,
-    is_nonretryable_rollout_failure,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -936,7 +934,6 @@ class AsyncNemoGymRolloutImpl:
         timeouts: Optional[RolloutTimeouts] = None,
         deadline_registry: Optional[RequestDeadlineRegistry] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
-        max_concurrent_gym_rows: Optional[int] = None,
         # Shared with the owning RolloutManager so row-level re-dispatches are visible
         # in the same counters as everything else. None when constructed directly.
         stats: Optional[RolloutStats] = None,
@@ -961,82 +958,10 @@ class AsyncNemoGymRolloutImpl:
             if retry_policy is not None
             else RolloutRetryPolicy.single_attempt()
         ).max_gym_row_attempts
-        self._max_concurrent_gym_rows = max_concurrent_gym_rows
-        self._gym_row_semaphore = (
-            asyncio.Semaphore(max_concurrent_gym_rows)
-            if max_concurrent_gym_rows is not None
-            else None
-        )
-        self._gym_rows_admitted = 0
-        self._gym_row_waiters = 0
         self._stats = stats
         self._effort_config = effort_config
-        # Keyed by the owning controller task. This is intentionally local state:
-        # watchdog snapshots must not make another Ray call into an already-stalled
-        # NeMo-Gym actor merely to explain what that actor has not returned.
-        self._active_gym_groups: dict[asyncio.Task[Any], dict[str, Any]] = {}
 
         self._validate_init_params()
-
-    def _active_group_registry(self) -> dict[asyncio.Task[Any], dict[str, Any]]:
-        """Return diagnostic state, lazily creating it for live-upgraded actors.
-
-        Development launchers mount the checkout directly into the container. A worker
-        can therefore have an instance constructed from the previous class definition
-        while a later task imports this method from the updated file. Diagnostics must
-        never turn that benign mixed-version window into a rollout failure.
-        """
-        registry = getattr(self, "_active_gym_groups", None)
-        if registry is None:
-            registry = {}
-            self._active_gym_groups = registry
-        return registry
-
-    def active_group_diagnostics(self) -> dict[str, Any]:
-        """Summarize prompt groups currently waiting on streamed Gym rows."""
-        now = time.monotonic()
-        groups = list(self._active_group_registry().values())
-        pending_histogram: dict[int, int] = {}
-        for group in groups:
-            pending = int(group["total_rows"]) - len(group["completed_indices"])
-            pending_histogram[pending] = pending_histogram.get(pending, 0) + 1
-        oldest = sorted(
-            (
-                {
-                    "group_id": group["group_id"],
-                    "age_seconds": now - float(group["started_at"]),
-                    "no_progress_seconds": now - float(group["last_progress_at"]),
-                    "completed_rows": len(group["completed_indices"]),
-                    "total_rows": int(group["total_rows"]),
-                    "pending_indices": sorted(
-                        set(group["expected_indices"]) - group["completed_indices"]
-                    ),
-                    "attempt": int(group["attempt"]),
-                    "last_error": group["last_error"],
-                }
-                for group in groups
-            ),
-            key=lambda group: group["age_seconds"],
-            reverse=True,
-        )[:5]
-        return {
-            "active_groups": len(groups),
-            "active_rows": sum(int(group["total_rows"]) for group in groups),
-            "completed_rows": sum(len(group["completed_indices"]) for group in groups),
-            "pending_rows": sum(
-                int(group["total_rows"]) - len(group["completed_indices"])
-                for group in groups
-            ),
-            "oldest_group_seconds": oldest[0]["age_seconds"] if oldest else 0.0,
-            "oldest_no_progress_seconds": (
-                max(group["no_progress_seconds"] for group in oldest) if oldest else 0.0
-            ),
-            "pending_histogram": pending_histogram,
-            "oldest_groups": oldest,
-            "row_admission_limit": self._max_concurrent_gym_rows,
-            "rows_admitted": self._gym_rows_admitted,
-            "row_admission_waiters": self._gym_row_waiters,
-        }
 
     async def run_rollout(
         self,
@@ -1205,7 +1130,6 @@ class AsyncNemoGymRolloutImpl:
         total_rows: int,
         timer_prefix: str,
         on_completion: Optional[RolloutCompletionCallback] = None,
-        progress_callback: Optional[Callable[[int], None]] = None,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1225,231 +1149,49 @@ class AsyncNemoGymRolloutImpl:
         inputs_by_rowidx = {row["_rowidx"]: row for row in pending}
         received: set[int] = set()
         env_timing_metrics: Optional[dict[str, Any]] = None
-        group_id = str(pending[0].get(NEMO_GYM_GROUP_ID_KEY, "<unknown>"))
-        attempt = pending[0].get(NEMO_GYM_GROUP_ATTEMPT_KEY, "<unknown>")
-        trace = f"{group_id}:{sorted(dispatched)}:{attempt}"
-        stream_started_at = time.monotonic()
-        print(
-            "NeMo-Gym RL stream: "
-            f"trace={trace} event=remote_create rows={len(pending)}",
-            flush=True,
-        )
-        result_stream = nemo_gym_env.run_rollouts.options(
+
+        async for result_ref in nemo_gym_env.run_rollouts.options(
             num_returns="streaming"
-        ).remote(pending, timer_prefix)
-        try:
-            async for result_ref in result_stream:
-                result_ref_received_at = time.monotonic()
-                print(
-                    "NeMo-Gym RL stream: "
-                    f"trace={trace} event=result_ref_received "
-                    f"elapsed_ms={(result_ref_received_at - stream_started_at) * 1000:.1f}",
-                    flush=True,
+        ).remote(pending, timer_prefix):
+            rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
+            # Validated against the original group, not the pending subset: on a
+            # re-dispatch the row keeps its original index so results stay ordered.
+            if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
+                raise ValueError(
+                    f"NeMo-Gym returned invalid row index {rowidx!r} for "
+                    f"{total_rows} inputs"
                 )
-                rowidx, resolved_agent_ref, result, timing_metrics = await result_ref
-                result_resolved_at = time.monotonic()
-                print(
-                    "NeMo-Gym RL stream: "
-                    f"trace={trace} row={rowidx} event=result_ref_resolved "
-                    f"resolve_ms={(result_resolved_at - result_ref_received_at) * 1000:.1f} "
-                    f"elapsed_ms={(result_resolved_at - stream_started_at) * 1000:.1f}",
-                    flush=True,
+            if rowidx not in dispatched:
+                raise ValueError(
+                    f"NeMo-Gym returned row index {rowidx}, which was not dispatched "
+                    f"in this attempt ({sorted(dispatched)})"
                 )
-                # Validated against the original group, not the pending subset: on a
-                # re-dispatch the row keeps its original index so results stay ordered.
-                if not isinstance(rowidx, int) or not 0 <= rowidx < total_rows:
-                    raise ValueError(
-                        f"NeMo-Gym returned invalid row index {rowidx!r} for "
-                        f"{total_rows} inputs"
-                    )
-                if rowidx not in dispatched:
-                    raise ValueError(
-                        f"NeMo-Gym returned row index {rowidx}, which was not dispatched "
-                        f"in this attempt ({sorted(dispatched)})"
-                    )
-                if rowidx in received:
-                    raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
-                received.add(rowidx)
-                inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
-                # A streamed completion may become durable recovery ownership before
-                # the rest of its prompt group finishes. Shape its reward first so a
-                # checkpoint never preserves a raw reward that finalization will later
-                # train on. The shaping rule is row-local; aggregation below is metrics
-                # only.
-                shaping_by_rowidx[rowidx] = _apply_effort_shaping(
-                    [result],
-                    [inputs_by_rowidx[rowidx]],
-                    self._effort_config,
-                )
-                results[rowidx] = result
-                if progress_callback is not None:
-                    progress_callback(rowidx)
-                if on_completion is not None:
-                    # Use the same conversion path as completed groups so streamed
-                    # recovery records inherit the current mask and reward semantics.
-                    # Completion callbacks are token-capture receipt-only, making this
-                    # conversion lightweight and safe to repeat during group metrics.
-                    callback_started_at = time.monotonic()
-                    row_completions, _ = self._results_to_completions([result])
-                    await on_completion(rowidx, row_completions[0])
-                    print(
-                        "NeMo-Gym RL stream: "
-                        f"trace={trace} row={rowidx} event=completion_callback_done "
-                        f"callback_ms={(time.monotonic() - callback_started_at) * 1000:.1f}",
-                        flush=True,
-                    )
-                if timing_metrics is not None:
-                    env_timing_metrics = timing_metrics
-                print(
-                    "NeMo-Gym RL stream: "
-                    f"trace={trace} row={rowidx} event=row_consumed",
-                    flush=True,
-                )
-        except BaseException as error:
-            # Propagate local deadline/cancellation to the remote async
-            # generator before the row-admission permit is released. Without
-            # this, retries can overlap abandoned Gym/model work even though
-            # the local asyncio task has already disappeared.
-            ray.cancel(result_stream)
-            print(
-                "NeMo-Gym RL stream: "
-                f"trace={trace} event=failed received={sorted(received)} "
-                f"elapsed_ms={(time.monotonic() - stream_started_at) * 1000:.1f} "
-                f"error={type(error).__name__}: {error!r}",
-                flush=True,
+            if rowidx in received:
+                raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
+            received.add(rowidx)
+            inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
+            # A streamed completion may become durable recovery ownership before
+            # the rest of its prompt group finishes. Shape its reward first so a
+            # checkpoint never preserves a raw reward that finalization will later
+            # train on. The shaping rule is row-local; aggregation below is metrics
+            # only.
+            shaping_by_rowidx[rowidx] = _apply_effort_shaping(
+                [result],
+                [inputs_by_rowidx[rowidx]],
+                self._effort_config,
             )
-            raise
-        else:
-            print(
-                "NeMo-Gym RL stream: "
-                f"trace={trace} event=exhausted received={sorted(received)} "
-                f"elapsed_ms={(time.monotonic() - stream_started_at) * 1000:.1f}",
-                flush=True,
-            )
+            results[rowidx] = result
+            if on_completion is not None:
+                # Use the same conversion path as completed groups so streamed
+                # recovery records inherit the current mask and reward semantics.
+                # Completion callbacks are token-capture receipt-only, making this
+                # conversion lightweight and safe to repeat during group metrics.
+                row_completions, _ = self._results_to_completions([result])
+                await on_completion(rowidx, row_completions[0])
+            if timing_metrics is not None:
+                env_timing_metrics = timing_metrics
 
         return env_timing_metrics
-
-    async def _stream_rows_with_admission(
-        self,
-        nemo_gym_env: Any,
-        pending: list[dict],
-        results: list[Optional[dict]],
-        shaping_by_rowidx: list[Optional[_EffortShapingMetrics]],
-        total_rows: int,
-        timer_prefix: str,
-        on_completion: Optional[RolloutCompletionCallback] = None,
-        progress_callback: Optional[Callable[[int], None]] = None,
-    ) -> Optional[dict[str, Any]]:
-        """Stream rows under a fleet-wide row admission cap.
-
-        NeMo-Gym normally fans an entire prompt group out at once. Across many
-        concurrent GRPO groups that turns a prompt-level limit into
-        ``groups * generations_per_prompt`` engine requests. The permit covers the
-        complete Gym row, including agent and reward work, because RL cannot observe
-        the nested model-call boundary inside Gym. This is therefore a bounded
-        row-lifecycle cap, not a claim of exact engine-slot accounting.
-        """
-        semaphore = self._gym_row_semaphore
-        if semaphore is None:
-            return await self._stream_rows(
-                nemo_gym_env,
-                pending,
-                results,
-                shaping_by_rowidx,
-                total_rows,
-                timer_prefix,
-                on_completion=on_completion,
-                progress_callback=progress_callback,
-            )
-
-        async def _run_one(row: dict) -> Optional[dict[str, Any]]:
-            group_id = str(row.get(NEMO_GYM_GROUP_ID_KEY, "<unknown>"))
-            rowidx = row.get("_rowidx", "<unknown>")
-            attempt = row.get(NEMO_GYM_GROUP_ATTEMPT_KEY, "<unknown>")
-            trace = f"{group_id}:{rowidx}:{attempt}"
-            wait_started_at = time.monotonic()
-            self._gym_row_waiters += 1
-            print(
-                "NeMo-Gym row admission: "
-                f"trace={trace} event=waiting admitted={self._gym_rows_admitted} "
-                f"waiters={self._gym_row_waiters} limit={self._max_concurrent_gym_rows}",
-                flush=True,
-            )
-            try:
-                await semaphore.acquire()
-            finally:
-                self._gym_row_waiters -= 1
-            self._gym_rows_admitted += 1
-            admitted_at = time.monotonic()
-            print(
-                "NeMo-Gym row admission: "
-                f"trace={trace} event=acquired "
-                f"wait_ms={(admitted_at - wait_started_at) * 1000:.1f} "
-                f"admitted={self._gym_rows_admitted} waiters={self._gym_row_waiters} "
-                f"limit={self._max_concurrent_gym_rows}",
-                flush=True,
-            )
-            try:
-                return await self._stream_rows(
-                    nemo_gym_env,
-                    [row],
-                    results,
-                    shaping_by_rowidx,
-                    total_rows,
-                    timer_prefix,
-                    on_completion=on_completion,
-                    progress_callback=progress_callback,
-                )
-            finally:
-                self._gym_rows_admitted -= 1
-                semaphore.release()
-                print(
-                    "NeMo-Gym row admission: "
-                    f"trace={trace} event=released "
-                    f"held_ms={(time.monotonic() - admitted_at) * 1000:.1f} "
-                    f"admitted={self._gym_rows_admitted} waiters={self._gym_row_waiters} "
-                    f"limit={self._max_concurrent_gym_rows}",
-                    flush=True,
-                )
-
-        # Do not cancel sibling asyncio tasks on the first error. The nested
-        # NeMo-Gym work is a remote Ray generator, and cancelling only this local
-        # await does not prove that the remote model request stopped. Let siblings
-        # drain before retrying missing rows so an old attempt cannot overlap its
-        # replacement and duplicate engine work.
-        outcomes = await asyncio.gather(
-            *(_run_one(row) for row in pending),
-            return_exceptions=True,
-        )
-
-        timing_metrics: dict[str, Any] = {}
-        first_error: Optional[BaseException] = None
-        for outcome in outcomes:
-            if isinstance(outcome, asyncio.CancelledError):
-                raise outcome
-            if isinstance(outcome, BaseException):
-                if first_error is None:
-                    first_error = outcome
-                continue
-            if outcome is None:
-                continue
-            for key, value in outcome.items():
-                # A per-row percentage cannot be combined without its original
-                # numerator and denominator. Omit it rather than report either a
-                # sum or an unweighted average as a group-level percentage.
-                if key.endswith("_pct"):
-                    continue
-                previous = timing_metrics.get(key)
-                if (
-                    isinstance(previous, (int, float))
-                    and isinstance(value, (int, float))
-                ):
-                    timing_metrics[key] = previous + value
-                else:
-                    timing_metrics[key] = value
-        if first_error is not None:
-            raise first_error
-        return timing_metrics or None
 
     async def _run_rollouts(
         self,
@@ -1484,39 +1226,6 @@ class AsyncNemoGymRolloutImpl:
         if len(expected_indices) != len(set(expected_indices)):
             raise ValueError("NeMo-Gym input rows contain duplicate _rowidx values")
 
-        owner_task = asyncio.current_task()
-        assert owner_task is not None
-        group_id = str(inputs[0].get(NEMO_GYM_GROUP_ID_KEY, "<unknown>"))
-        diagnostic = {
-            "group_id": group_id,
-            "started_at": time.monotonic(),
-            "last_progress_at": time.monotonic(),
-            "total_rows": len(expected_indices),
-            "configured_group_rows": total_rows,
-            "expected_indices": set(expected_indices),
-            "completed_indices": set(),
-            "attempt": 0,
-            "last_error": None,
-        }
-        active_groups = self._active_group_registry()
-        active_groups[owner_task] = diagnostic
-        owner_task.add_done_callback(lambda task: active_groups.pop(task, None))
-
-        def _record_row_progress(rowidx: int) -> None:
-            diagnostic["completed_indices"].add(rowidx)
-            diagnostic["last_progress_at"] = time.monotonic()
-            age = diagnostic["last_progress_at"] - diagnostic["started_at"]
-            if age >= 60.0:
-                pending_indices = sorted(
-                    diagnostic["expected_indices"] - diagnostic["completed_indices"]
-                )
-                print(
-                    "NeMo-Gym row progress: "
-                    f"group={group_id} row={rowidx} age={age:.1f}s "
-                    f"attempt={diagnostic['attempt']} pending={pending_indices}",
-                    flush=True,
-                )
-
         # Run generation and restore input order as results stream back.
         with timer.time(f"{timer_prefix}/run_rollouts"):
             results: list[dict | None] = [None for _ in range(total_rows)]
@@ -1549,23 +1258,12 @@ class AsyncNemoGymRolloutImpl:
                 registry=self._deadline_registry,
             ):
                 for attempt in range(1, max_row_attempts + 1):
-                    diagnostic["attempt"] = attempt
                     pending = [row for row in inputs if results[row["_rowidx"]] is None]
                     if not pending:
                         break
-                    pending_indices = [row["_rowidx"] for row in pending]
-                    print(
-                        "NeMo-Gym row dispatch: "
-                        f"group={group_id} age="
-                        f"{time.monotonic() - diagnostic['started_at']:.1f}s "
-                        f"attempt={attempt}/{max_row_attempts} "
-                        f"pending={pending_indices}",
-                        flush=True,
-                    )
                     if attempt > 1:
                         print(
-                            f"NeMo-Gym: group={group_id} re-dispatching "
-                            f"{len(pending)}/{total_rows} "
+                            f"NeMo-Gym: re-dispatching {len(pending)}/{total_rows} "
                             f"row(s) (attempt {attempt}/{max_row_attempts})",
                             flush=True,
                         )
@@ -1575,7 +1273,7 @@ class AsyncNemoGymRolloutImpl:
                         if self._stats is not None:
                             self._stats.record_gym_row_redispatch(len(pending))
                     try:
-                        timing_metrics = await self._stream_rows_with_admission(
+                        timing_metrics = await self._stream_rows(
                             nemo_gym_env,
                             pending,
                             results,
@@ -1583,20 +1281,9 @@ class AsyncNemoGymRolloutImpl:
                             total_rows,
                             timer_prefix,
                             on_completion=on_completion,
-                            progress_callback=_record_row_progress,
                         )
                     except Exception as error:
                         last_error = error
-                        diagnostic["last_error"] = f"{type(error).__name__}: {error}"
-                        print(
-                            "NeMo-Gym row dispatch failed: "
-                            f"group={group_id} age="
-                            f"{time.monotonic() - diagnostic['started_at']:.1f}s "
-                            f"attempt={attempt}/{max_row_attempts} "
-                            f"pending={pending_indices} "
-                            f"error={type(error).__name__}: {error!r}",
-                            flush=True,
-                        )
                         # Only transport-shaped failures are worth another dispatch; a
                         # prompt NeMo-Gym cannot serve fails the same way every time.
                         if (
@@ -1671,7 +1358,6 @@ class AsyncNemoGymRolloutImpl:
 
         rollout_metrics.update(env_timing_metrics)
 
-        active_groups.pop(owner_task, None)
         return completions, prompt_message_log, rollout_metrics
 
     def _results_to_completions(
@@ -1883,7 +1569,6 @@ class RolloutManager:
         tq_buffer: Optional[TQReplayBuffer] = None,
         timeouts: Optional[RolloutTimeouts] = None,
         retry_policy: Optional[RolloutRetryPolicy] = None,
-        max_concurrent_gym_rows: Optional[int] = None,
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
     ) -> None:
@@ -1932,7 +1617,6 @@ class RolloutManager:
             deadline_registry=self._request_deadlines,
             # Only the NeMo-Gym impl reads these; the native impl absorbs them via kwargs.
             retry_policy=self._retry_policy,
-            max_concurrent_gym_rows=max_concurrent_gym_rows,
             stats=self._stats,
             effort_config=effort_config,
         )
@@ -2022,13 +1706,6 @@ class RolloutManager:
             "recovery_siblings_reused": self._recovery_siblings_reused,
             "recovery_siblings_rerun": self._recovery_siblings_redispatched,
         }
-
-    def active_rollout_diagnostics(self) -> dict[str, Any]:
-        """Return local long-tail state without contacting NeMo-Gym."""
-        snapshot = getattr(self._impl, "active_group_diagnostics", None)
-        if snapshot is None:
-            return {}
-        return snapshot()
 
     def record_canonical_publication(self, output_tokens: int) -> None:
         """Count one prompt group after its canonical TQ commit succeeds."""
@@ -2282,8 +1959,6 @@ class RolloutManager:
                 # a required downstream stage (for example MOPD teacher inference),
                 # and would spend the rollout retry budget on the wrong subsystem.
                 if _contains_post_write_enrichment_error(error):
-                    raise
-                if is_nonretryable_rollout_failure(error):
                     raise
                 reason = type(error).__name__
 

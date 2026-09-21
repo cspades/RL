@@ -181,18 +181,6 @@ log = logging.getLogger(__name__)
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
 
 
-def _watchdog_tag(value: int) -> str:
-    """Letters-only sequence tag that survives Ray's numeric log deduplication."""
-    value = int(value)
-    chars = []
-    while True:
-        value, remainder = divmod(value, 26)
-        chars.append(chr(ord("a") + remainder))
-        if value == 0:
-            return "".join(reversed(chars))
-        value -= 1
-
-
 @dataclass(frozen=True)
 class _RolloutCheckpointSaveResult:
     """Outcome returned by one rollout checkpoint save attempt."""
@@ -3153,7 +3141,6 @@ class SingleControllerActor:
         max_num_steps = self._algo_cfg.max_num_steps
         last_progress = (-1, -1)
         last_progress_at = time.monotonic()
-        heartbeat_index = 0
 
         while True:
             await asyncio.sleep(watchdog_cfg.interval_s)
@@ -3170,104 +3157,24 @@ class SingleControllerActor:
             metrics["rollout/inflight"] = float(self._inflight_rollouts)
             metrics["rollout/idle_s"] = idle_s
             metrics["rollout/train_steps"] = float(self._train_steps)
-            gym_diagnostics = self._rollout_manager.active_rollout_diagnostics()
-            if gym_diagnostics:
-                for key in (
-                    "active_groups",
-                    "active_rows",
-                    "completed_rows",
-                    "pending_rows",
-                    "oldest_group_seconds",
-                    "oldest_no_progress_seconds",
-                ):
-                    metrics[f"rollout/gym_{key}"] = float(gym_diagnostics[key])
             if self._gen_fleet is not None:
                 metrics.update(self._gen_fleet.as_metrics())
             if self._engine_supervisor is not None:
                 metrics.update(self._engine_supervisor.as_metrics())
-            router_diagnostics: dict[str, Any] = {}
             if self._generation_router is not None:
                 # router/* counters are exactly what you want when a backend starts
                 # failing. Best-effort like the membership push: a router being
                 # recreated must not cost a metrics tick.
                 try:
-                    router_diagnostics = await self._ray_get(
-                        self._generation_router.diagnostics.remote()
+                    metrics.update(
+                        await self._ray_get(self._generation_router.metrics.remote())
                     )
-                    router_metric_names = {
-                        "requests_total": "requests_total",
-                        "responses_total": "responses_total",
-                        "no_backend_total": "no_healthy_backend_total",
-                        "backend_error_total": "backend_error_total",
-                        "serving_backends": "serving_backends",
-                        "inflight_requests": "inflight_requests",
-                        "oldest_inflight_seconds": "oldest_inflight_seconds",
-                        "seconds_since_last_request": "seconds_since_last_request",
-                        "seconds_since_last_response": "seconds_since_last_response",
-                    }
-                    for key, metric_name in router_metric_names.items():
-                        metrics[f"router/{metric_name}"] = float(
-                            router_diagnostics[key]
-                        )
-                    admission = router_diagnostics.get("admission", {})
-                    for key in ("requests", "waiters", "bytes"):
-                        metrics[f"router/admission_{key}"] = float(
-                            admission.get(key, 0)
-                        )
                 except Exception as error:  # noqa: BLE001 - metrics are advisory
                     print(
                         f"watchdog: router metrics unavailable this tick: "
                         f"{type(error).__name__}: {error}",
                         flush=True,
                     )
-            pending_histogram = gym_diagnostics.get("pending_histogram", {})
-            oldest_groups = gym_diagnostics.get("oldest_groups", [])
-            oldest_group_text = (
-                ",".join(
-                    f"{group.get('group_id', '?')}:"
-                    f"{group['completed_rows']}/{group['total_rows']}"
-                    f"@{group['age_seconds']:.0f}s"
-                    f"/idle={group['no_progress_seconds']:.0f}s"
-                    f"/pending={group.get('pending_indices', [])}"
-                    for group in oldest_groups
-                )
-                or "none"
-            )
-            router_active = router_diagnostics.get("active_by_backend", {})
-            router_active_text = (
-                ",".join(
-                    f"{backend.rsplit(':', 1)[-1]}:{count}"
-                    for backend, count in router_active.items()
-                    if count
-                )
-                or "none"
-            )
-            watchdog_message = (
-                "rollout watchdog: "
-                f"tag={_watchdog_tag(heartbeat_index)} "
-                f"committed={stats.committed} train_step={self._train_steps} "
-                f"idle={idle_s:.0f}s inflight_groups={self._inflight_rollouts}/"
-                f"{self._async_cfg.max_inflight_prompts} "
-                f"tasks={len(self._dispatched_rollouts)} "
-                f"waiters(buffer/slot/permit)="
-                f"{self._buffer_capacity_waiters}/{self._rollout_slot_waiters}/"
-                f"{self._rollout_permitted_waiters} "
-                f"permitted={int(self._rollout_permitted.is_set())} "
-                f"buffered={len(self._buffer)}/{self._async_cfg.max_buffered_rollouts} "
-                f"gym_groups={gym_diagnostics.get('active_groups', 0)} "
-                f"gym_pending_rows={gym_diagnostics.get('pending_rows', 0)} "
-                f"gym_rows_admitted={gym_diagnostics.get('rows_admitted', 0)}/"
-                f"{gym_diagnostics.get('row_admission_limit')} "
-                f"gym_row_waiters={gym_diagnostics.get('row_admission_waiters', 0)} "
-                f"pending_hist={pending_histogram} oldest_groups=[{oldest_group_text}] "
-                f"router_requests={router_diagnostics.get('requests_total', -1)} "
-                f"router_inflight={router_diagnostics.get('inflight_requests', -1)} "
-                f"router_oldest={router_diagnostics.get('oldest_inflight_seconds', -1):.0f}s "
-                f"router_phases={router_diagnostics.get('active_by_phase', {})} "
-                f"router_active=[{router_active_text}]"
-            )
-            log.warning(watchdog_message)
-            heartbeat_index += 1
             self._logger.log_metrics(
                 metrics, step=self._train_steps, step_metric="rollout/train_steps"
             )
@@ -3283,7 +3190,7 @@ class SingleControllerActor:
                         raise RuntimeError(
                             f"environment health check failed -- {detail}"
                         )
-                    log.warning("environment health -- %s", detail)
+                    print(f"WARNING: environment health -- {detail}", flush=True)
 
             if self._gen_fleet is not None and not self._recovering_from_refit:
                 # Raises once too few shards remain for the run to be worth continuing.
@@ -3304,7 +3211,7 @@ class SingleControllerActor:
                 )
                 if watchdog_cfg.stall_action == "abort":
                     raise RolloutStall(message)
-                log.warning("rollout stall -- %s", message)
+                print(f"WARNING: rollout stall -- {message}", flush=True)
 
     async def _gen_fleet_probe_pump(self) -> None:
         """Probe the generation fleet on its own clock.
