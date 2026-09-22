@@ -160,34 +160,10 @@ echo "  Gym/router/watchdog timeouts=${NEMO_GYM_ROLLOUT_TIMEOUT_S}/${GENERATION_
 # hf_config_overrides reaches vLLM for anything on the model config: setup.py
 # copies it verbatim into vllm_kwargs.hf_overrides.
 #
-# video_maintain_aspect_ratio is the exception, because it does not live on the
-# model config at all. The checkpoint keeps it on the image processor
-# (image_processing.py's __init__ default of True; preprocessor_config.json does
-# not even list the key), and _compute_target_patches_video reads it off the
-# instance. hf_overrides never touches that object, and the processor's
-# ImagesKwargs validator rejects it as an mm_processor_kwarg, so vLLM always
-# frames video aspect-preserving. data.default is therefore the only side that
-# can move, and it has to move to true: at 1024 target patches a 16:9 frame
-# resolves to a 24x42 patch grid (252 embeddings per tubelet) rather than the
-# square 32x32 grid (256). With data.default at false the RL-side media carried
-# 32*256=8192 features while the vLLM-authored token_ids held 32*252=8064
-# placeholders, and training died in _merge_projected_media with
-# "Expanded-sequence media alignment failed: found 8064 valid placeholders for
-# 8192 projected features".
-#
-# true is also the only value all three implementations can agree on, which is
-# what makes this run comparable to the Megatron twin. MCore reimplements the
-# preprocessing and honors mcore_generation_config.video_maintain_aspect_ratio
-# in either direction, and its aspect-preserving branch in
-# dynamic_res_preprocess() is arithmetically identical to the HF processor's
-# _compute_target_patches_video (same round(sqrt(...)) pair, same
-# grid_multiple=2 round-up-if-it-fits rule). vLLM cannot be moved off
-# aspect-preserving at all, so both twins are pinned to true rather than
-# pinning Megatron to false and leaving vLLM unable to follow.
-#
-# hf_config_overrides.video_maintain_aspect_ratio below is inert for the same
-# reason, but it is hashed into the HF->Megatron conversion cache directory name
-# (__hfovr_2f0c5088375e), so dropping the key would force a full reconvert.
+# Keep vLLM and RL preprocessing explicitly aspect-preserving. At 1024 target
+# patches a 16:9 frame resolves to a 24x42 patch grid (252 embeddings per
+# tubelet), while square preprocessing produces 32x32 (256). Mixing those modes
+# causes placeholder/projected-feature alignment failures during training.
 exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh" \
   ++policy.megatron_cfg.freeze_moe_router="${FREEZE_MOE_ROUTER}" \
   ++policy.megatron_cfg.moe_router_load_balancing_type="${MOE_ROUTER_LOAD_BALANCING_TYPE}" \
@@ -196,7 +172,7 @@ exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh"
   ++policy.megatron_cfg.mtp_detach_heads="${MTP_DETACH_HEADS}" \
   ++policy.hf_config_overrides.video_temporal_patch_size="${TEMPORAL_PATCH_SIZE}" \
   ++policy.hf_config_overrides.video_target_num_patches="${VIDEO_TARGET_PATCHES}" \
-  ++policy.hf_config_overrides.video_maintain_aspect_ratio=false \
+  ++policy.hf_config_overrides.video_maintain_aspect_ratio=true \
   ++policy.generation.backend=vllm \
   ++policy.generation.refit_transport=null \
   ++policy.generation.bad_words="['<image>','<img>','</img>','<so_embedding>','<so_start>','<so_end>']" \
