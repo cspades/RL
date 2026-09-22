@@ -64,6 +64,17 @@ export OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-true}"
 export OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
 export OFFLOAD_OPTIMIZER_FOR_LOGPROB="${OFFLOAD_OPTIMIZER_FOR_LOGPROB:-true}"
 
+# MoE-router and MTP settings pinned to the 32n4g Super VL values so this
+# smoke run rehearses the real configuration rather than the recipe defaults,
+# which leave the router training with load balancing on and MTP using
+# repeated layers with detached heads. The 30B checkpoint is not the Super VL
+# teacher, so back any of these out individually if it rejects them.
+FREEZE_MOE_ROUTER="${FREEZE_MOE_ROUTER:-true}"
+MOE_ROUTER_LOAD_BALANCING_TYPE="${MOE_ROUTER_LOAD_BALANCING_TYPE:-none}"
+MOE_ROUTER_BIAS_UPDATE_RATE="${MOE_ROUTER_BIAS_UPDATE_RATE:-0.0}"
+MTP_USE_REPEATED_LAYER="${MTP_USE_REPEATED_LAYER:-false}"
+MTP_DETACH_HEADS="${MTP_DETACH_HEADS:-false}"
+
 export WANDB_ENABLED="${WANDB_ENABLED:-false}"
 export MONITOR_GPUS="${MONITOR_GPUS:-true}"
 export MEGATRON_TRANSFORMER_IMPL="${MEGATRON_TRANSFORMER_IMPL:-inference_optimized}"
@@ -85,12 +96,17 @@ echo "  sequence/new_tokens=${MAX_SEQUENCE_LENGTH}/${MAX_NEW_TOKENS}"
 echo "  Gym/router/watchdog timeouts=${NEMO_GYM_ROLLOUT_TIMEOUT_S}/${GENERATION_ROUTER_BACKEND_TIMEOUT_S}/${STALL_WATCHDOG_TIMEOUT_S}s"
 
 exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh" \
+  ++policy.megatron_cfg.freeze_moe_router="${FREEZE_MOE_ROUTER}" \
+  ++policy.megatron_cfg.moe_router_load_balancing_type="${MOE_ROUTER_LOAD_BALANCING_TYPE}" \
+  ++policy.megatron_cfg.moe_router_bias_update_rate="${MOE_ROUTER_BIAS_UPDATE_RATE}" \
+  ++policy.megatron_cfg.mtp_use_repeated_layer="${MTP_USE_REPEATED_LAYER}" \
+  ++policy.megatron_cfg.mtp_detach_heads="${MTP_DETACH_HEADS}" \
   ++policy.generation.bad_words="['<image>','<img>','</img>','<so_embedding>','<so_start>','<so_end>']" \
   ++policy.generation.mcore_generation_config.http_server_num_replicas="${HTTP_SERVER_NUM_REPLICAS}" \
   ++policy.generation.mcore_generation_config.image_dynamic_resolution=true \
-  ++policy.generation.mcore_generation_config.video_maintain_aspect_ratio=false \
+  ++policy.generation.mcore_generation_config.video_maintain_aspect_ratio=true \
   ++data.shuffle="${DATA_SHUFFLE}" \
-  ++data.default.video_maintain_aspect_ratio=false \
+  ++data.default.video_maintain_aspect_ratio=true \
   ++env.nemo_gym.config_paths="[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/mcqa/configs/mcqa.yaml,resources_servers/string_match/configs/string_match.yaml,resources_servers/sav_tracks/configs/sav_tracks.yaml]" \
   ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s="${NEMO_GYM_ROLLOUT_TIMEOUT_S}" \
   ++async_rl.generation_router.enabled=true \
