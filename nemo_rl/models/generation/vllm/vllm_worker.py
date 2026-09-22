@@ -95,6 +95,21 @@ def _context_capped_max_new_tokens(
     return min(configured_max_new_tokens, remaining_context)
 
 
+def _apply_nemotron_omni_architecture_alias(
+    vllm_kwargs: dict[str, Any], hf_config: Any
+) -> None:
+    """Use the vLLM 0.26 Super alias for the generic Super-VL export name."""
+    if getattr(hf_config, "architectures", None) != [
+        "NemotronH_Omni_Reasoning_V3"
+    ]:
+        return
+
+    hf_overrides = vllm_kwargs.setdefault("hf_overrides", {})
+    hf_overrides.setdefault(
+        "architectures", ["NemotronH_Super_Omni_Reasoning_V3"]
+    )
+
+
 def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
     """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
 
@@ -762,6 +777,7 @@ class BaseVllmGenerationWorker:
         )
         _validate_worker_extension_cls(vllm_kwargs, default_worker_extension_cls)
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
+        _apply_nemotron_omni_architecture_alias(vllm_kwargs, hf_config)
         _apply_nemotron_omni_layer_truncation(vllm_kwargs, hf_config)
 
         llm_kwargs = dict(

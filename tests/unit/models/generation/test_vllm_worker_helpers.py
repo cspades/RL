@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    _apply_nemotron_omni_architecture_alias,
     _apply_nemotron_omni_layer_truncation,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
@@ -26,6 +27,31 @@ from nemo_rl.models.generation.vllm.worker_utils import (
     resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
 )
+
+
+def test_nemotron_omni_uses_registered_super_architecture_alias():
+    vllm_kwargs = {"hf_overrides": {"max_position_embeddings": 1024}}
+
+    _apply_nemotron_omni_architecture_alias(
+        vllm_kwargs,
+        SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"]),
+    )
+
+    assert vllm_kwargs["hf_overrides"] == {
+        "max_position_embeddings": 1024,
+        "architectures": ["NemotronH_Super_Omni_Reasoning_V3"],
+    }
+
+
+def test_nemotron_omni_architecture_alias_preserves_explicit_override():
+    vllm_kwargs = {"hf_overrides": {"architectures": ["CustomArchitecture"]}}
+
+    _apply_nemotron_omni_architecture_alias(
+        vllm_kwargs,
+        SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"]),
+    )
+
+    assert vllm_kwargs["hf_overrides"]["architectures"] == ["CustomArchitecture"]
 
 
 def test_nemotron_omni_layer_truncation_builds_nested_hf_override():
