@@ -105,7 +105,7 @@ export MIN_GENERATION_TOKENS="${MIN_GENERATION_TOKENS:-16384}"
 # mode asserts on it during VllmConfig validation. The shared launcher disables
 # it for TASK=vstat, so the override is applied here.
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
-export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-4}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-32}"
 export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-${MAX_SEQUENCE_LENGTH}}"
 export VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
 export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
@@ -203,7 +203,7 @@ export EXTRA_OVERRIDES="\
 ++policy.generation.ignore_eos=false \
 ++policy.generation.bad_words=\"['<image>','<img>','</img>','<so_embedding>','<so_start>','<so_end>']\" \
 ++data.default.video_sampling_style=nemotron_vl \
-++data.default.video_maintain_aspect_ratio=true \
+++data.default.video_maintain_aspect_ratio=false \
 ++grpo.deduplicate_multimodal_data=false \
 ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s=${NEMO_GYM_ROLLOUT_TIMEOUT_S} \
 ++async_rl.generation_router.enabled=true \
