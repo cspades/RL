@@ -38,7 +38,6 @@ from megatron.bridge.training.utils.train_utils import (
 )
 from megatron.bridge.utils.common_utils import get_rank_safe
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.strategies.torch import get_async_strategy
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallelV1,
@@ -47,6 +46,9 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_model_config, unwrap_model
+from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+    FileSystemWriterAsync,
+)
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
@@ -4605,11 +4607,9 @@ class MegatronPolicyWorkerImpl(
             terminate=release_cuda_cache,
         )
         if release_cuda_cache:
-            _, async_modules = get_async_strategy(
-                self.mcore_state.cfg.checkpoint.async_strategy
+            cleanup_tensor_caches = getattr(
+                FileSystemWriterAsync, "cleanup_tensor_caches", None
             )
-            writer_cls = async_modules["FileSystemWriterAsync"]
-            cleanup_tensor_caches = getattr(writer_cls, "cleanup_tensor_caches", None)
             if cleanup_tensor_caches is not None:
                 cleanup_tensor_caches()
             else:
