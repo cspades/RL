@@ -41,6 +41,7 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 from nemo_rl.environments.nemo_gym import (
     NemoGym,
     NemoGymConfig,
+    _strip_initial_multimodal_payload,
     build_reward_component_columns,
     extract_reward_components,
     setup_nemo_gym_config,
@@ -75,6 +76,37 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+def test_strip_initial_multimodal_payload_preserves_expanded_tokens():
+    initial_media = PackedTensor(torch.ones(2, 3, 2, 2), dim_to_pack=0)
+    later_media = PackedTensor(torch.zeros(1, 3, 2, 2), dim_to_pack=0)
+    token_ids = torch.tensor([1, 2, 3])
+    initial_user = {
+        "role": "user",
+        "token_ids": token_ids,
+        "pixel_values": initial_media,
+        "media_token_validity_mask": torch.tensor([True, True, False]),
+    }
+    later_user = {
+        "role": "user",
+        "token_ids": torch.tensor([4]),
+        "pixel_values": later_media,
+    }
+    result = {
+        "input_message_log": [initial_user],
+        "message_log": [
+            initial_user,
+            {"role": "assistant", "token_ids": torch.tensor([9])},
+            later_user,
+        ],
+    }
+
+    assert _strip_initial_multimodal_payload(result) is True
+    assert result["message_log"][0]["token_ids"] is token_ids
+    assert "pixel_values" not in result["message_log"][0]
+    assert "media_token_validity_mask" not in result["message_log"][0]
+    assert result["message_log"][2]["pixel_values"] is later_media
 
 
 def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(

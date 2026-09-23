@@ -56,7 +56,6 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.experience.rollouts import (
     RolloutGroupResult,
-    attach_initial_nemo_gym_image_payloads,
     run_async_multi_turn_rollout_groups,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -916,12 +915,6 @@ class AsyncTrajectoryCollector:
             # Rows are stamped at yield time, so this slice carries its
             # original stream ordinals; record them for the outstanding set.
             dispatched_task_indices = _stamped_task_indices(rollout_batch)
-            if use_nemo_gym and self._deduplicate_multimodal_data:
-                attach_initial_nemo_gym_image_payloads(
-                    rollout_batch,
-                    self.processor,
-                    env_config=self.master_config.env,
-                )
             repeated_batch = rollout_batch.repeat_interleave(
                 num_generations,
                 share_immutable_media=self._deduplicate_multimodal_data,

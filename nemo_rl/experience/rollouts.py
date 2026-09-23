@@ -237,6 +237,59 @@ def _reattach_original_multimodal_payloads(
         _reattach_static_multimodal_payloads_to_result(result, original_log)
 
 
+def _reattach_group_multimodal_payloads(
+    rows: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+) -> None:
+    """Share one authoritative Gym-processed media payload per prompt group."""
+    if len(rows) != len(results):
+        raise ValueError("NeMo-Gym rows and results must have matching lengths")
+
+    group_indices: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        group_id = row.get(NEMO_GYM_GROUP_ID_KEY)
+        if not isinstance(group_id, str) or not group_id:
+            raise ValueError(
+                f"NeMo-Gym row {index} is missing {NEMO_GYM_GROUP_ID_KEY}"
+            )
+        group_indices.setdefault(group_id, []).append(index)
+
+    for group_id, indices in group_indices.items():
+        omitted = [
+            index
+            for index in indices
+            if results[index].get("_initial_multimodal_data_omitted", False)
+        ]
+        if not omitted:
+            for index in indices:
+                results[index].pop("_initial_multimodal_data_omitted", None)
+            continue
+
+        source_index = next(
+            (
+                index
+                for index in indices
+                if "_initial_multimodal_data_omitted" not in results[index]
+            ),
+            None,
+        )
+        if source_index is None:
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_id!r} omitted every media payload"
+            )
+        source_log = results[source_index].get("input_message_log")
+        if not source_log:
+            raise ValueError(
+                f"NeMo-Gym prompt group {group_id!r} has no canonical input message"
+            )
+        for index in omitted:
+            _reattach_static_multimodal_payloads_to_result(
+                results[index], source_log
+            )
+        for index in indices:
+            results[index].pop("_initial_multimodal_data_omitted", None)
+
+
 def _reattach_static_multimodal_payloads_to_result(
     result: dict[str, Any],
     source_message_log: list[dict[str, Any]],
@@ -2857,12 +2910,19 @@ async def run_async_nemo_gym_rollout(
                 completed_group = accumulator.add(
                     rowidx, result, resolved_agent_ref=resolved_agent_ref
                 )
-                if original_message_logs is not None:
+                if (
+                    original_message_logs is not None
+                    and not deduplicate_multimodal_data
+                ):
                     _reattach_static_multimodal_payloads_to_result(
                         result, original_message_logs[rowidx]
                     )
                     result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:
+                    if deduplicate_multimodal_data:
+                        _reattach_group_multimodal_payloads(
+                            completed_group.rows, completed_group.results
+                        )
                     group_input_batch = input_batch.slice(
                         completed_group.group_index * num_generations,
                         (completed_group.group_index + 1) * num_generations,
