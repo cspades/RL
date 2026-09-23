@@ -61,7 +61,7 @@ uv run examples/nemo_gym/run_grpo_nemo_gym.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 uv run tests/check_metrics.py $JSON_METRICS \
-    'median(data["train/gen_kl_error"]) < 1.3'
+    'median(data["train/gen_kl_error"]) < 0.1'
 
 # Clean up checkpoint directory after successful run to save space.
 rm -rf "$CKPT_DIR"
