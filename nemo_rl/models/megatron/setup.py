@@ -22,6 +22,7 @@ import warnings
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
+from datetime import timedelta
 from typing import Any, Callable, Optional, TypeVar, cast
 
 import torch
@@ -504,7 +505,15 @@ def setup_distributed(config) -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Initialize process group
-    torch.distributed.init_process_group("nccl")
+    timeout_minutes = config.get("megatron_cfg", {}).get(
+        "distributed_timeout_minutes"
+    )
+    if timeout_minutes is None:
+        torch.distributed.init_process_group("nccl")
+    else:
+        torch.distributed.init_process_group(
+            "nccl", timeout=timedelta(minutes=timeout_minutes)
+        )
 
 
 def validate_and_set_config(

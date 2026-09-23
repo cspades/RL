@@ -409,6 +409,44 @@ def test_nemo_gym_initial_media_stays_compact_through_replay_and_policy_flatten(
     assert media.as_tensor().shape == (generations, 3, 2, 2)
 
 
+def test_group_dedup_reattaches_gym_media_without_replacing_token_ids():
+    canonical_media = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
+    canonical_mask = torch.tensor([True, True, False])
+    target_token_ids = torch.tensor([1, 2, 3])
+    canonical_user = {
+        "role": "user",
+        "token_ids": torch.tensor([1, 2, 3]),
+        "pixel_values": canonical_media,
+        "media_token_validity_mask": canonical_mask,
+    }
+    target_user = {"role": "user", "token_ids": target_token_ids}
+    rows = [
+        {NEMO_GYM_GROUP_ID_KEY: "group"},
+        {NEMO_GYM_GROUP_ID_KEY: "group"},
+    ]
+    results = [
+        {
+            "input_message_log": [canonical_user],
+            "message_log": [canonical_user],
+        },
+        {
+            "_initial_multimodal_data_omitted": True,
+            "input_message_log": [target_user],
+            "message_log": [target_user],
+        },
+    ]
+
+    rollouts_mod._reattach_group_multimodal_payloads(rows, results)
+
+    restored_user = results[1]["message_log"][0]
+    assert restored_user["token_ids"] is target_token_ids
+    assert restored_user["pixel_values"] is canonical_media
+    assert "_initial_multimodal_data_omitted" not in results[1]
+    torch.testing.assert_close(
+        restored_user["media_token_validity_mask"], canonical_mask
+    )
+
+
 def test_dedup_generation_sends_only_vllm_ready_media():
     class _Generation:
         cfg = {"backend": "vllm"}
