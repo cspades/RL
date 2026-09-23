@@ -41,6 +41,8 @@ from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.data.interfaces import NemoGymSourceIdentity
 from nemo_rl.data.multimodal_utils import (
+    VLLM_PROMPT_KEYS,
+    PackedTensor,
     attach_image_model_inputs_to_message,
     extract_input_media_sources_from_responses_messages,
     media_sources_equal,
@@ -77,6 +79,7 @@ from nemo_rl.experience.failures import (
     RolloutDataFailure,
     http_status_is_infra,
 )
+from nemo_rl.experience.interfaces import NEMO_GYM_ROLLOUT_INDEX_KEY
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -88,6 +91,32 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
+
+
+def _strip_initial_multimodal_payload(result: dict[str, Any]) -> bool:
+    """Remove policy media from the initial user turn after tokenization."""
+    stripped = False
+    seen_messages: set[int] = set()
+    for log_key in ("input_message_log", "message_log"):
+        message_log = result.get(log_key)
+        if not message_log:
+            continue
+        initial_user = next(
+            (message for message in message_log if message.get("role") == "user"),
+            None,
+        )
+        if initial_user is None or id(initial_user) in seen_messages:
+            continue
+        seen_messages.add(id(initial_user))
+        for key, value in list(initial_user.items()):
+            if (
+                isinstance(value, PackedTensor)
+                or key in VLLM_PROMPT_KEYS
+                or key == "media_token_validity_mask"
+            ):
+                initial_user.pop(key)
+                stripped = True
+    return stripped
 
 # The three server-type keys Gym nests under a top-level config entry. Gym's
 # constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
@@ -804,11 +833,20 @@ Depending on your data shape, you may want to change these values."""
                         nemo_gym_row, nemo_gym_result
                     )
                 else:
+                    rollout_index = nemo_gym_row.get(NEMO_GYM_ROLLOUT_INDEX_KEY)
+                    include_initial_multimodal_data = (
+                        not deduplicate_multimodal_data
+                        or not isinstance(rollout_index, int)
+                        or rollout_index == 0
+                    )
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
                         nemo_gym_row,
                         nemo_gym_result,
                         tokenizer,
-                        include_initial_multimodal_data=not deduplicate_multimodal_data,
+                        # Always tokenize with the authoritative Gym-processed media.
+                        # For deduplication, all but one sibling are stripped below
+                        # only after their expanded token IDs have been produced.
+                        include_initial_multimodal_data=include_initial_multimodal_data,
                     )
                     if _has_nan_generation_logprobs(nemo_rl_result):
                         raise RuntimeError("Generation logprobs contain NaN")
@@ -1082,10 +1120,6 @@ Depending on your data shape, you may want to change these values."""
             and initial_media_matches_raw_input
             and returned_media_matches_raw_input
         )
-        if initial_multimodal_data_omitted:
-            media_messages, _ = _without_initial_media_sources(
-                media_messages, raw_initial_sources
-            )
         per_turn_images = (
             _index_per_turn_images(
                 response["output"],
@@ -1295,6 +1329,8 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
             "full_result": nemo_gym_result,
         }
         if not include_initial_multimodal_data:
+            if initial_multimodal_data_omitted:
+                _strip_initial_multimodal_payload(result)
             result["_initial_multimodal_data_omitted"] = initial_multimodal_data_omitted
         return result
 

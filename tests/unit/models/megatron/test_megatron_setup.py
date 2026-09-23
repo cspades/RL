@@ -27,6 +27,7 @@ nemo_rl.models.megatron.setup, focusing on:
 import os
 import warnings
 from dataclasses import dataclass, field, fields
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3454,6 +3455,32 @@ class TestCreateMegatronConfigOptimizerOffload:
             assert "overlap_cpu_optimizer_d2h_h2d" not in optimizer_kwargs
         else:
             assert optimizer_kwargs["overlap_cpu_optimizer_d2h_h2d"] is transfer_overlap
+
+
+@pytest.mark.mcore
+class TestSetupDistributed:
+    @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")
+    @patch("nemo_rl.models.megatron.setup.configure_dynamo_cache")
+    @patch("nemo_rl.models.megatron.setup.configure_refit_environment")
+    @patch("nemo_rl.models.megatron.setup.torch.distributed.init_process_group")
+    def test_respects_configured_timeout(
+        self,
+        init_process_group,
+        configure_refit_environment,
+        configure_dynamo_cache,
+        destroy_parallel_state,
+    ):
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        config = {"megatron_cfg": {"distributed_timeout_minutes": 45}}
+        setup_distributed(config)
+
+        configure_refit_environment.assert_called_once_with(config)
+        configure_dynamo_cache.assert_called_once_with()
+        destroy_parallel_state.assert_called_once_with()
+        init_process_group.assert_called_once_with(
+            "nccl", timeout=timedelta(minutes=45)
+        )
 
 
 @pytest.mark.mcore

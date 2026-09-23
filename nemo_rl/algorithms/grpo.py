@@ -469,10 +469,16 @@ def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
         return
 
     generation_config = master_config.policy["generation"]
-    if generation_config.get("backend") != "vllm":
+    backend = generation_config.get("backend")
+    megatron_async = (
+        backend == "megatron"
+        and master_config.grpo.async_grpo is not None
+        and master_config.grpo.async_grpo.enabled
+    )
+    if backend != "vllm" and not megatron_async:
         raise NotImplementedError(
             "grpo.deduplicate_multimodal_data=true is currently qualified "
-            "only with policy.generation.backend=vllm."
+            "only with policy.generation.backend=vllm or async GRPO Megatron."
         )
     # The data plane accepts deduplicated payloads, so the wire format is not
     # the constraint -- but note what dedup buys there. ``to_wire`` emits one
