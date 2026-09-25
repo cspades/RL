@@ -450,6 +450,26 @@ export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-/opt/ray_venvs}"
 export NEMO_GYM_VENV_DIR="${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}"
 export NEMO_GYM_EXTRA_ROOTS="${NEMO_GYM_EXTRA_ROOTS:-${CONTAINER_NEMORL}/3rdparty/Gym-workspace/Gym}"
+# The mounted checkout requires SpanGroup, but older nightly containers can
+# carry nemo-lens 0.1 in both the driver and cached Ray worker environments.
+# Keep this revision synchronized with the nemo-lens source in pyproject.toml.
+export NEMO_LENS_RUNTIME_REV="${NEMO_LENS_RUNTIME_REV:-b85578fc2b736a1804705e537001b5f45e9c715d}"
+NEMO_LENS_RUNTIME_SETUP="\
+ensure_nemo_lens_runtime() {
+  local python=\$1
+  if \"\${python}\" -c 'from nemo.lens.groups import SpanGroup' >/dev/null 2>&1; then
+    return
+  fi
+  echo \"[nemo-lens] Updating \${python} to ${NEMO_LENS_RUNTIME_REV}\"
+  uv pip install --python \"\${python}\" \"nemo-lens[sdk] @ git+https://github.com/NVIDIA-NeMo/Lens.git@${NEMO_LENS_RUNTIME_REV}\"
+  \"\${python}\" -c 'from nemo.lens.groups import SpanGroup'
+}
+ensure_nemo_lens_runtime /opt/nemo_rl_venv/bin/python
+for python in ${NEMO_RL_VENV_DIR}/*/bin/python; do
+  if [[ -x \"\${python}\" ]]; then
+    ensure_nemo_lens_runtime \"\${python}\"
+  fi
+done"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-10.0}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export FLASHINFER_DISABLE_VERSION_CHECK="${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
@@ -494,24 +514,29 @@ if [[ "${TASK}" == "vstat" ]]; then
     export SETUP_COMMAND="\
 set -euo pipefail
 cd ${CONTAINER_NEMORL}
+${NEMO_LENS_RUNTIME_SETUP}
 MEGATRON_WORKER_PYTHON=${NEMO_RL_VENV_DIR}/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
 if [[ ! -x \${MEGATRON_WORKER_PYTHON} ]]; then
   FORCE_REBUILD_VENV=${NRL_FORCE_REBUILD_VENVS} uv run --no-sync python -c 'import os; from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES; from nemo_rl.utils.venvs import create_local_venv; create_local_venv(PY_EXECUTABLES.MCORE, \"nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker\", force_rebuild=os.environ[\"FORCE_REBUILD_VENV\"].lower() == \"true\")'
 fi
+ensure_nemo_lens_runtime \${MEGATRON_WORKER_PYTHON}
 AUDIO_DEPS_STAGGER_MAX_S=${AUDIO_DEPS_STAGGER_MAX_S:-30} RAY_MEGATRON_PYTHON=\${MEGATRON_WORKER_PYTHON} bash tools/install_audio_deps.sh
 if [[ ! -x ${VLLM_WORKER_PYTHON} ]]; then
   FORCE_REBUILD_VENV=${NRL_FORCE_REBUILD_VENVS} VLLM_WORKER_CLASS=${VLLM_WORKER_CLASS} uv run --no-sync python -c 'import os; from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES; from nemo_rl.utils.venvs import create_local_venv; create_local_venv(PY_EXECUTABLES.VLLM_GYM, os.environ[\"VLLM_WORKER_CLASS\"], force_rebuild=os.environ[\"FORCE_REBUILD_VENV\"].lower() == \"true\")'
 fi
+ensure_nemo_lens_runtime ${VLLM_WORKER_PYTHON}
 ${VLLM_RUNTIME_PATCH_COMMAND}
 ${VLLM_WORKER_PYTHON} -c 'import torchcodec'"
   else
     export SETUP_COMMAND="\
 set -euo pipefail
 cd ${CONTAINER_NEMORL}
+${NEMO_LENS_RUNTIME_SETUP}
 MEGATRON_WORKER_PYTHON=${NEMO_RL_VENV_DIR}/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker/bin/python
 if [[ ! -x \${MEGATRON_WORKER_PYTHON} ]]; then
   FORCE_REBUILD_VENV=${NRL_FORCE_REBUILD_VENVS} uv run --no-sync python -c 'import os; from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES; from nemo_rl.utils.venvs import create_local_venv; create_local_venv(PY_EXECUTABLES.MCORE, \"nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker\", force_rebuild=os.environ[\"FORCE_REBUILD_VENV\"].lower() == \"true\")'
 fi
+ensure_nemo_lens_runtime \${MEGATRON_WORKER_PYTHON}
 AUDIO_DEPS_STAGGER_MAX_S=${AUDIO_DEPS_STAGGER_MAX_S:-30} RAY_MEGATRON_PYTHON=\${MEGATRON_WORKER_PYTHON} bash tools/install_audio_deps.sh"
   fi
 fi
