@@ -83,6 +83,9 @@ export VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
 export VLLM_LIMIT_MM_IMAGES="${VLLM_LIMIT_MM_IMAGES:-64}"
 export MOE_BACKEND="${MOE_BACKEND:-flashinfer_cutlass}"
 export NRL_REFIT_BUFFER_MEMORY_RATIO="${NRL_REFIT_BUFFER_MEMORY_RATIO:-0.005}"
+# The image contains vLLM 0.26. Apply the Python-only RADIO final-LayerNorm
+# backport in each generation worker venv instead of replacing its compiled package.
+export VLLM_RUNTIME_PATCH_SCRIPT="${VLLM_RUNTIME_PATCH_SCRIPT:-${CONTAINER_NEMORL}/scripts/patch_vllm_super_omni_radio_layernorm.py}"
 # Avoid large unusable reserved blocks as packed sequence sizes vary.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 

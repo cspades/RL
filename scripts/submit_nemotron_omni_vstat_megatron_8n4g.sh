@@ -423,6 +423,10 @@ else
   VLLM_WORKER_CLASS="nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
 fi
 VLLM_WORKER_PYTHON="${NEMO_RL_VENV_DIR}/${VLLM_WORKER_CLASS}/bin/python"
+VLLM_RUNTIME_PATCH_COMMAND=""
+if [[ -n "${VLLM_RUNTIME_PATCH_SCRIPT:-}" ]]; then
+  VLLM_RUNTIME_PATCH_COMMAND="${VLLM_WORKER_PYTHON} ${VLLM_RUNTIME_PATCH_SCRIPT}"
+fi
 export SETUP_COMMAND="\
 set -euo pipefail
 cd ${CONTAINER_NEMORL}
@@ -437,6 +441,7 @@ if [[ ${GENERATION_BACKEND} == vllm ]]; then
     echo '[audio-deps] Creating the vLLM Gym worker environment'
     FORCE_REBUILD_VENV=${NRL_FORCE_REBUILD_VENVS} VLLM_WORKER_CLASS=${VLLM_WORKER_CLASS} uv run --no-sync python -c 'import os; from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES; from nemo_rl.utils.venvs import create_local_venv; create_local_venv(PY_EXECUTABLES.VLLM_GYM, os.environ[\"VLLM_WORKER_CLASS\"], force_rebuild=os.environ[\"FORCE_REBUILD_VENV\"].lower() == \"true\")'
   fi
+  ${VLLM_RUNTIME_PATCH_COMMAND}
   ${VLLM_WORKER_PYTHON} -c 'import torchcodec'
 fi"
 

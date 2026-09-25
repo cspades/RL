@@ -111,6 +111,9 @@ export VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
 export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
 export VLLM_CAP_MAX_TOKENS_TO_CONTEXT="${VLLM_CAP_MAX_TOKENS_TO_CONTEXT:-true}"
 export VLLM_REFIT_TIMEOUT_S="${VLLM_REFIT_TIMEOUT_S:-300}"
+# The image contains vLLM 0.26. Apply the Python-only RADIO final-LayerNorm
+# backport in each generation worker venv instead of replacing its compiled package.
+export VLLM_RUNTIME_PATCH_SCRIPT="${VLLM_RUNTIME_PATCH_SCRIPT:-${CONTAINER_NEMORL}/scripts/patch_vllm_super_omni_radio_layernorm.py}"
 
 # Rows in this manifest carry their media as input_image parts, never as a
 # native video part. Cached rows (35547 of 65474) hold exactly 64 frames tagged
