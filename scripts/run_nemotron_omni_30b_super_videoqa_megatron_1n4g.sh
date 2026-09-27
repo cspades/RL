@@ -9,7 +9,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
 
+# Nightly containers can predate the Lens API required by the mounted checkout.
+"${SCRIPT_DIR}/update_nemo_lens.sh"
+
 DATA_ROOT="${DATA_ROOT:-${NEMORL}/workspace/datasets/super-vl-35-videoqa}"
+# DATA_FILENAME="${DATA_FILENAME:-hybrid-repro-2rows.jsonl}"
 DATA_FILENAME="${DATA_FILENAME:-train_sav_all_tracks_plus_caprl_exclude6215_hsg_mediafixed_9.jsonl}"
 DATA_JSONL="${DATA_JSONL:-${DATA_ROOT}/${DATA_FILENAME}}"
 MEDIA_ROOT="${MEDIA_ROOT:-/lustre/fs1/portfolios}"
@@ -45,16 +49,20 @@ export MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-65536}"
 export INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-65536}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
 export MIN_GENERATION_TOKENS="${MIN_GENERATION_TOKENS:-4096}"
+export GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-0.0}"
+export VAL_GENERATION_TEMPERATURE="${VAL_GENERATION_TEMPERATURE:-0.0}"
 
 # Keep the first optimizer step small enough for the 2-GPU policy partition.
 # Increase these explicitly when stress-testing frontend concurrency.
 export NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-2}"
 export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-2}"
 export TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))}"
-export DATA_SHUFFLE="${DATA_SHUFFLE:-true}"
+export DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 export MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-2}"
 export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-4}"
 export MAX_STEPS="${MAX_STEPS:-100000}"
+export LR_DECAY_ITERS="${LR_DECAY_ITERS:-100000}"
+export MIN_LR="${MIN_LR:-2.0e-9}"
 
 # Full optimizer CPU offload, as the 67B vision 1n4g runner does: the 2-GPU
 # train half cannot hold master weights and Adam moments alongside the vocab
@@ -79,6 +87,11 @@ export WANDB_ENABLED="${WANDB_ENABLED:-false}"
 export MONITOR_GPUS="${MONITOR_GPUS:-true}"
 export MEGATRON_TRANSFORMER_IMPL="${MEGATRON_TRANSFORMER_IMPL:-inference_optimized}"
 export MEGATRON_CUDA_GRAPH_IMPL="${MEGATRON_CUDA_GRAPH_IMPL:-local}"
+# Match the Nano HF processor used by the vLLM twin. MCore otherwise defaults
+# to ceil grid rounding and PIL bicubic resize, which can change both the
+# placeholder count and vision embeddings.
+IMAGE_DYNAMIC_RESOLUTION_ROUNDING_MODE="${IMAGE_DYNAMIC_RESOLUTION_ROUNDING_MODE:-round_plus_half}"
+IMAGE_DYNAMIC_RESOLUTION_RESIZE_MODE="${IMAGE_DYNAMIC_RESOLUTION_RESIZE_MODE:-torch_bicubic_antialias}"
 export VISION_EMBEDDING_CACHE_MAX_BYTES="${VISION_EMBEDDING_CACHE_MAX_BYTES:-8589934592}"
 export PREFIX_CACHING_MAMBA_GB="${PREFIX_CACHING_MAMBA_GB:-8}"
 export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/nemotron-omni-30b-super-videoqa-megatron-1n4g}"
@@ -101,12 +114,23 @@ exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh"
   ++policy.megatron_cfg.moe_router_bias_update_rate="${MOE_ROUTER_BIAS_UPDATE_RATE}" \
   ++policy.megatron_cfg.mtp_use_repeated_layer="${MTP_USE_REPEATED_LAYER}" \
   ++policy.megatron_cfg.mtp_detach_heads="${MTP_DETACH_HEADS}" \
+  ++policy.megatron_cfg.optimizer.min_lr="${MIN_LR}" \
+  ++policy.megatron_cfg.scheduler.lr_decay_iters="${LR_DECAY_ITERS}" \
+  ++policy.megatron_cfg.scheduler.lr_decay_style=cosine \
+  policy.generation.temperature="${GENERATION_TEMPERATURE}" \
+  policy.generation.val_temperature="${VAL_GENERATION_TEMPERATURE}" \
   ++policy.generation.bad_words="['<image>','<img>','</img>','<so_embedding>','<so_start>','<so_end>']" \
   ++policy.generation.mcore_generation_config.http_server_num_replicas="${HTTP_SERVER_NUM_REPLICAS}" \
   ++policy.generation.mcore_generation_config.image_dynamic_resolution=true \
+  ++policy.generation.mcore_generation_config.image_dynamic_resolution_rounding_mode="${IMAGE_DYNAMIC_RESOLUTION_ROUNDING_MODE}" \
+  ++policy.generation.mcore_generation_config.image_dynamic_resolution_resize_mode="${IMAGE_DYNAMIC_RESOLUTION_RESIZE_MODE}" \
+  ++policy.generation.mcore_generation_config.parsers="[nemotron-v3-reasoning]" \
+  ++policy.generation.mcore_generation_config.multimodal_prompt_config.video_spec.expansion_mode=temporal_patch \
+  ++policy.generation.mcore_generation_config.multimodal_prompt_config.video_spec.include_frame_timestamps_for_nemotron_vl=true \
   ++policy.generation.mcore_generation_config.video_maintain_aspect_ratio=true \
   ++data.shuffle="${DATA_SHUFFLE}" \
   ++data.default.video_maintain_aspect_ratio=true \
+  ++data.default.video_prompt_expansion_mode=temporal_patch \
   ++env.nemo_gym.config_paths="[responses_api_models/vllm_model/configs/vllm_model_for_training.yaml,resources_servers/mcqa/configs/mcqa.yaml,resources_servers/string_match/configs/string_match.yaml,resources_servers/sav_tracks/configs/sav_tracks.yaml]" \
   ++async_rl.rollout_failure.nemo_gym.rollout_timeout_s="${NEMO_GYM_ROLLOUT_TIMEOUT_S}" \
   ++async_rl.generation_router.enabled=true \

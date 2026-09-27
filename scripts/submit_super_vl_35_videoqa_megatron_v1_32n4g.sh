@@ -9,6 +9,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
 
+# Do not reuse Super-VL checkpoints converted before MBridge restored the
+# trained post-RADIO final LayerNorm.
+export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-final-ln-v1}"
+
 MODEL_REL="${MODEL_REL:-workspace/models/super-vl-35-video-teacher-step-120/hf}"
 DATA_REL="${DATA_REL:-workspace/datasets/super-vl-35-videoqa}"
 DATA_FILENAME="${DATA_FILENAME:-train_sav_all_tracks_plus_caprl_exclude6215_hsg_mediafixed_9.jsonl}"
@@ -50,6 +54,8 @@ export NUM_PROMPTS="${NUM_PROMPTS:-128}"
 export NUM_GENERATIONS="${NUM_GENERATIONS:-16}"
 export TRAIN_GBS="${TRAIN_GBS:-2048}"
 export MAX_STEPS="${MAX_STEPS:-1000000}"
+export LR_DECAY_ITERS="${LR_DECAY_ITERS:-100000}"
+export MIN_LR="${MIN_LR:-2.0e-9}"
 export ASYNC_GRPO="${ASYNC_GRPO:-true}"
 export MAX_TRAJECTORY_AGE_STEPS="${MAX_TRAJECTORY_AGE_STEPS:-1}"
 export IN_FLIGHT_WEIGHT_UPDATES="${IN_FLIGHT_WEIGHT_UPDATES:-true}"
@@ -97,7 +103,9 @@ export VISION_EMBEDDING_CACHE_MAX_BYTES="${VISION_EMBEDDING_CACHE_MAX_BYTES:-171
 # Avoid large unusable reserved blocks as packed sequence sizes vary.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-false}"
+export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-true}"
+export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-5}"
+export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-2}"
 export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-videoqa-megatron-v1}"
 export VIDEO_TEACHER_RESULTS_DIR="${VIDEO_TEACHER_RESULTS_DIR:-${RESULTS_DIR}}"
 export VIDEO_TEACHER_GYM_VENV_DIR="${VIDEO_TEACHER_GYM_VENV_DIR:-${CONTAINER_NEMORL}/workspace/gym_venvs/super-vl-35-videoqa}"
@@ -122,6 +130,10 @@ export EXTRA_OVERRIDES="\
 ++policy.megatron_cfg.moe_router_bias_update_rate=0.0 \
 ++policy.megatron_cfg.mtp_use_repeated_layer=false \
 ++policy.megatron_cfg.mtp_detach_heads=false \
+++policy.megatron_cfg.optimizer.min_lr=${MIN_LR} \
+++policy.megatron_cfg.scheduler.lr_decay_iters=${LR_DECAY_ITERS} \
+++policy.megatron_cfg.scheduler.lr_decay_style=cosine \
+++grpo.overlong_filtering=true \
 ++policy.router_replay.enabled=false \
 ++policy.sequence_packing.train_mb_tokens=${TRAIN_MB_TOKENS} \
 ++policy.sequence_packing.logprob_mb_tokens=${LOGPROB_MB_TOKENS} \
@@ -139,10 +151,17 @@ export EXTRA_OVERRIDES="\
 ++policy.generation.mcore_generation_config.image_dynamic_resolution_resize_mode=${IMAGE_DYNAMIC_RESOLUTION_RESIZE_MODE} \
 ++policy.generation.mcore_generation_config.megatron_inference_wrapper=megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper \
 ++policy.generation.mcore_generation_config.parsers=[deepseek-r1-reasoning] \
+++policy.generation.mcore_generation_config.multimodal_prompt_config.content_part_order=preserve \
+++policy.generation.mcore_generation_config.multimodal_prompt_config.video_spec.expansion_mode=temporal_patch \
+++policy.generation.mcore_generation_config.multimodal_prompt_config.video_spec.include_frame_timestamps_for_nemotron_vl=true \
 ++policy.generation.mcore_generation_config.video_maintain_aspect_ratio=false \
 ++data.default.video_maintain_aspect_ratio=false \
+++data.default.video_prompt_expansion_mode=temporal_patch \
 ++grpo.deduplicate_multimodal_data=true \
 ++checkpointing.checkpoint_dir=${VIDEO_TEACHER_RESULTS_DIR}/checkpoints \
+++checkpointing.save_period=${CHECKPOINT_SAVE_PERIOD} \
+++checkpointing.save_optimizer=true \
+++checkpointing.keep_top_k=${CHECKPOINT_KEEP_TOP_K} \
 ++logger.log_dir=${VIDEO_TEACHER_RESULTS_DIR}/logs \
 ++logger.wandb.name=${VIDEO_TEACHER_WANDB_NAME}-\${NRL_SLURM_JOB_ID} \
 ++logger.wandb.project=${VIDEO_TEACHER_WANDB_PROJECT} \

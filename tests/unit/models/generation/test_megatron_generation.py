@@ -64,7 +64,7 @@ def _master_config_for_megatron_validation(
 
 
 @pytest.mark.mcore
-def test_nemotron_video_style_materializes_megatron_prompt_contract() -> None:
+def test_nemotron_video_style_does_not_materialize_megatron_prompt_contract() -> None:
     config = deepcopy(basic_megatron_test_config)
     mcore_config = config["generation"]["mcore_generation_config"]
     mcore_config["multimodal_prompt_config"] = {
@@ -83,14 +83,11 @@ def test_nemotron_video_style_materializes_megatron_prompt_contract() -> None:
 
     assert mcore_config["multimodal_prompt_config"]["video_spec"] == {
         "model_token": "<video>",
-        "content_part_separator": "\n",
-        "expansion_mode": "temporal_patch",
-        "include_frame_timestamps_for_nemotron_vl": True,
     }
 
 
 @pytest.mark.mcore
-def test_nemotron_video_style_rejects_conflicting_megatron_prompt_contract() -> None:
+def test_nemotron_video_style_accepts_explicit_megatron_prompt_contract() -> None:
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["mcore_generation_config"]["multimodal_prompt_config"] = {
         "video_spec": {"expansion_mode": "single"}
@@ -99,8 +96,11 @@ def test_nemotron_video_style_rejects_conflicting_megatron_prompt_contract() -> 
         config, {"default": {"video_sampling_style": "nemotron_vl"}}
     )
 
-    with pytest.raises(ValueError, match="video_spec conflicts"):
-        MegatronGeneration.validate_settings(master_config)
+    MegatronGeneration.validate_settings(master_config)
+
+    assert config["generation"]["mcore_generation_config"][
+        "multimodal_prompt_config"
+    ]["video_spec"] == {"expansion_mode": "single"}
 
 
 @pytest.mark.mcore

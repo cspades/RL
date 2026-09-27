@@ -450,19 +450,19 @@ export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 export NEMO_RL_VENV_DIR="${NEMO_RL_VENV_DIR:-/opt/ray_venvs}"
 export NEMO_GYM_VENV_DIR="${NEMO_GYM_VENV_DIR:-/opt/gym_venvs}"
 export NEMO_GYM_EXTRA_ROOTS="${NEMO_GYM_EXTRA_ROOTS:-${CONTAINER_NEMORL}/3rdparty/Gym-workspace/Gym}"
-# The mounted checkout requires SpanGroup, but older nightly containers can
-# carry nemo-lens 0.1 in both the driver and cached Ray worker environments.
+# The mounted checkout requires SpanRegistry, but older nightly containers can
+# carry an incompatible nemo-lens in both driver and cached worker environments.
 # Keep this revision synchronized with the nemo-lens source in pyproject.toml.
-export NEMO_LENS_RUNTIME_REV="${NEMO_LENS_RUNTIME_REV:-b85578fc2b736a1804705e537001b5f45e9c715d}"
+export NEMO_LENS_RUNTIME_REV="${NEMO_LENS_RUNTIME_REV:-b0f977d414b2f89938604a0b7eaa78ee08bc8700}"
 NEMO_LENS_RUNTIME_SETUP="\
 ensure_nemo_lens_runtime() {
   local python=\$1
-  if \"\${python}\" -c 'from nemo.lens.groups import SpanGroup' >/dev/null 2>&1; then
+  if \"\${python}\" -c 'from nemo.lens.groups import SpanRegistry; from nemo.lens.instruments import MetricSpec, register_metric_group' >/dev/null 2>&1; then
     return
   fi
   echo \"[nemo-lens] Updating \${python} to ${NEMO_LENS_RUNTIME_REV}\"
-  uv pip install --python \"\${python}\" \"nemo-lens[sdk] @ git+https://github.com/NVIDIA-NeMo/Lens.git@${NEMO_LENS_RUNTIME_REV}\"
-  \"\${python}\" -c 'from nemo.lens.groups import SpanGroup'
+  uv pip install --python \"\${python}\" \"nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@${NEMO_LENS_RUNTIME_REV}\"
+  \"\${python}\" -c 'from nemo.lens.groups import SpanRegistry; from nemo.lens.instruments import MetricSpec, register_metric_group'
 }
 ensure_nemo_lens_runtime /opt/nemo_rl_venv/bin/python
 for python in ${NEMO_RL_VENV_DIR}/*/bin/python; do

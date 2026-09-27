@@ -8,6 +8,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
+unset VLLM_RUNTIME_PATCH_SCRIPT
+
+# The Megatron policy must be reconverted with the restored vision final norm
+# before its weights are streamed into the vLLM generation model.
+export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-final-ln-v1}"
 
 MODEL_REL="${MODEL_REL:-workspace/models/super-vl-35-video-teacher-step-120/hf}"
 DATA_REL="${DATA_REL:-workspace/datasets/super-vl-35-videoqa}"
@@ -50,6 +55,8 @@ export NUM_PROMPTS="${NUM_PROMPTS:-128}"
 export NUM_GENERATIONS="${NUM_GENERATIONS:-16}"
 export TRAIN_GBS="${TRAIN_GBS:-2048}"
 export MAX_STEPS="${MAX_STEPS:-1000000}"
+export LR_DECAY_ITERS="${LR_DECAY_ITERS:-100000}"
+export MIN_LR="${MIN_LR:-2.0e-9}"
 export ASYNC_GRPO="${ASYNC_GRPO:-true}"
 export MAX_TRAJECTORY_AGE_STEPS="${MAX_TRAJECTORY_AGE_STEPS:-1}"
 export IN_FLIGHT_WEIGHT_UPDATES="${IN_FLIGHT_WEIGHT_UPDATES:-true}"
@@ -83,9 +90,6 @@ export VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
 export VLLM_LIMIT_MM_IMAGES="${VLLM_LIMIT_MM_IMAGES:-64}"
 export MOE_BACKEND="${MOE_BACKEND:-flashinfer_cutlass}"
 export NRL_REFIT_BUFFER_MEMORY_RATIO="${NRL_REFIT_BUFFER_MEMORY_RATIO:-0.005}"
-# The image contains vLLM 0.26. Apply the Python-only RADIO final-LayerNorm
-# backport in each generation worker venv instead of replacing its compiled package.
-export VLLM_RUNTIME_PATCH_SCRIPT="${VLLM_RUNTIME_PATCH_SCRIPT:-${CONTAINER_NEMORL}/scripts/patch_vllm_super_omni_radio_layernorm.py}"
 # Avoid large unusable reserved blocks as packed sequence sizes vary.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -100,7 +104,9 @@ export STORE_PARAM_REMAINDERS="${STORE_PARAM_REMAINDERS:-false}"
 export OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-false}"
 export OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-false}"
 
-export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-false}"
+export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-true}"
+export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-5}"
+export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-2}"
 export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-videoqa-vllm-v1}"
 export VIDEO_TEACHER_RESULTS_DIR="${VIDEO_TEACHER_RESULTS_DIR:-${RESULTS_DIR}}"
 export VIDEO_TEACHER_GYM_VENV_DIR="${VIDEO_TEACHER_GYM_VENV_DIR:-${CONTAINER_NEMORL}/workspace/gym_venvs/super-vl-35-videoqa}"
@@ -125,14 +131,15 @@ export EXTRA_OVERRIDES="\
 ++policy.megatron_cfg.moe_router_bias_update_rate=0.0 \
 ++policy.megatron_cfg.mtp_use_repeated_layer=false \
 ++policy.megatron_cfg.mtp_detach_heads=false \
+++policy.megatron_cfg.optimizer.min_lr=${MIN_LR} \
+++policy.megatron_cfg.scheduler.lr_decay_iters=${LR_DECAY_ITERS} \
+++policy.megatron_cfg.scheduler.lr_decay_style=cosine \
+++grpo.overlong_filtering=true \
 ++policy.router_replay.enabled=false \
 ++policy.sequence_packing.train_mb_tokens=${TRAIN_MB_TOKENS} \
 ++policy.sequence_packing.logprob_mb_tokens=${LOGPROB_MB_TOKENS} \
 ++policy.sequence_packing.microbatch_order=largest_first \
 ++policy.megatron_cfg.optimizer.overlap_cpu_optimizer_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} \
-++policy.hf_config_overrides.video_maintain_aspect_ratio=false \
-++policy.hf_config_overrides.video_temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
-++policy.hf_config_overrides.video_target_num_patches=${VIDEO_TARGET_PATCHES} \
 ++policy.generation.temperature=1.0 \
 ++policy.generation.top_p=1.0 \
 ++policy.generation.ignore_eos=false \
@@ -147,6 +154,9 @@ export EXTRA_OVERRIDES="\
 ++data.default.video_maintain_aspect_ratio=false \
 ++grpo.deduplicate_multimodal_data=true \
 ++checkpointing.checkpoint_dir=${VIDEO_TEACHER_RESULTS_DIR}/checkpoints \
+++checkpointing.save_period=${CHECKPOINT_SAVE_PERIOD} \
+++checkpointing.save_optimizer=true \
+++checkpointing.keep_top_k=${CHECKPOINT_KEEP_TOP_K} \
 ++logger.log_dir=${VIDEO_TEACHER_RESULTS_DIR}/logs \
 ++logger.wandb.name=${VIDEO_TEACHER_WANDB_NAME}-\${NRL_SLURM_JOB_ID} \
 ++logger.wandb.project=${VIDEO_TEACHER_WANDB_PROJECT} \

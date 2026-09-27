@@ -225,6 +225,35 @@ PY
     # after PyAV has been installed, since project sync intentionally excludes av.
     export NRL_FORCE_REBUILD_VENVS=false
   fi
+  VLLM_WORKER_PYTHON=""
+  if [[ -n "${VLLM_RUNTIME_PATCH_SCRIPT:-}" ]]; then
+    VLLM_WORKER_CLASS="nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
+    VLLM_WORKER_PYTHON="${NEMO_RL_VENV_DIR}/${VLLM_WORKER_CLASS}/bin/python"
+    if [[ ! -x "${VLLM_WORKER_PYTHON}" ]]; then
+      echo "Creating the vLLM generation worker environment before patching vLLM"
+      FORCE_REBUILD_VENV="${NRL_FORCE_REBUILD_VENVS:-false}" \
+        VLLM_WORKER_CLASS="${VLLM_WORKER_CLASS}" \
+        uv run --no-sync python - <<'PY'
+import os
+
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.utils.venvs import create_local_venv
+
+create_local_venv(
+    PY_EXECUTABLES.VLLM_GYM,
+    os.environ["VLLM_WORKER_CLASS"],
+    force_rebuild=os.environ["FORCE_REBUILD_VENV"].lower() == "true",
+)
+PY
+    fi
+  fi
+  if [[ -n "${VLLM_RUNTIME_PATCH_SCRIPT:-}" ]]; then
+    if [[ ! -f "${VLLM_RUNTIME_PATCH_SCRIPT}" ]]; then
+      echo "Missing vLLM runtime patch: ${VLLM_RUNTIME_PATCH_SCRIPT}" >&2
+      exit 1
+    fi
+    "${VLLM_WORKER_PYTHON}" "${VLLM_RUNTIME_PATCH_SCRIPT}"
+  fi
   if ! python -c "import torchcodec" >/dev/null 2>&1 ||
      ! "${MEGATRON_WORKER_PYTHON}" -c "import av" >/dev/null 2>&1; then
     RAY_MEGATRON_PYTHON="${MEGATRON_WORKER_PYTHON}" \
