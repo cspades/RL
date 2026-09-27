@@ -17,8 +17,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
+unset VLLM_RUNTIME_PATCH_SCRIPT
+
+# Nightly containers can predate the Lens API required by the mounted checkout.
+"${SCRIPT_DIR}/update_nemo_lens.sh"
 
 DATA_ROOT="${DATA_ROOT:-${NEMORL}/workspace/datasets/super-vl-35-videoqa}"
+# DATA_FILENAME="${DATA_FILENAME:-hybrid-repro-2rows.jsonl}"
 DATA_FILENAME="${DATA_FILENAME:-train_sav_all_tracks_plus_caprl_exclude6215_hsg_mediafixed_9.jsonl}"
 DATA_JSONL="${DATA_JSONL:-${DATA_ROOT}/${DATA_FILENAME}}"
 MEDIA_ROOT="${MEDIA_ROOT:-/lustre/fs1/portfolios}"
@@ -55,16 +60,20 @@ export MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-65536}"
 export INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-65536}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
 export MIN_GENERATION_TOKENS="${MIN_GENERATION_TOKENS:-4096}"
+export GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-0.0}"
+export VAL_GENERATION_TEMPERATURE="${VAL_GENERATION_TEMPERATURE:-0.0}"
 
 # Keep the first optimizer step small enough for the 2-GPU policy partition.
 # Increase these explicitly when stress-testing frontend concurrency.
 export NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-2}"
 export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-2}"
 export TRAIN_GBS="${TRAIN_GBS:-$((NUM_PROMPTS_PER_STEP * NUM_GENERATIONS_PER_PROMPT))}"
-export DATA_SHUFFLE="${DATA_SHUFFLE:-true}"
+export DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 export MAX_INFLIGHT_PROMPTS="${MAX_INFLIGHT_PROMPTS:-2}"
 export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-4}"
 export MAX_STEPS="${MAX_STEPS:-100000}"
+export LR_DECAY_ITERS="${LR_DECAY_ITERS:-100000}"
+export MIN_LR="${MIN_LR:-2.0e-9}"
 
 # Full optimizer CPU offload, matching the Megatron twin: the 2-GPU train half
 # cannot hold master weights and Adam moments alongside the vocab logits for a
@@ -156,13 +165,14 @@ echo "  Gym/router/watchdog timeouts=${NEMO_GYM_ROLLOUT_TIMEOUT_S}/${GENERATION_
 # reasoning parser is likewise left at the recipe's nemotron_v3, which matches
 # this checkpoint.
 #
-# The generation backend still has to be told the video geometry, and
-# hf_config_overrides reaches vLLM for anything on the model config: setup.py
-# copies it verbatim into vllm_kwargs.hf_overrides.
+# The generation backend still has to be told the video geometry through its
+# video and media-I/O settings below. Processor-only controls such as target
+# patches and aspect-ratio handling do not belong in hf_config_overrides;
+# vLLM's native processor owns those.
 #
-# Keep vLLM and RL preprocessing explicitly aspect-preserving. At 1024 target
-# patches a 16:9 frame resolves to a 24x42 patch grid (252 embeddings per
-# tubelet), while square preprocessing produces 32x32 (256). Mixing those modes
+# Keep vLLM and RL preprocessing explicitly aspect-preserving. At 256 target
+# patches a 16:9 frame resolves to a 12x20 patch grid (60 embeddings per
+# tubelet), while square preprocessing produces 16x16 (64). Mixing those modes
 # causes placeholder/projected-feature alignment failures during training.
 exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh" \
   ++policy.megatron_cfg.freeze_moe_router="${FREEZE_MOE_ROUTER}" \
@@ -170,9 +180,11 @@ exec bash "${SCRIPT_DIR}/run_nemotron_omni_multimodal_single_controller_1n4g.sh"
   ++policy.megatron_cfg.moe_router_bias_update_rate="${MOE_ROUTER_BIAS_UPDATE_RATE}" \
   ++policy.megatron_cfg.mtp_use_repeated_layer="${MTP_USE_REPEATED_LAYER}" \
   ++policy.megatron_cfg.mtp_detach_heads="${MTP_DETACH_HEADS}" \
-  ++policy.hf_config_overrides.video_temporal_patch_size="${TEMPORAL_PATCH_SIZE}" \
-  ++policy.hf_config_overrides.video_target_num_patches="${VIDEO_TARGET_PATCHES}" \
-  ++policy.hf_config_overrides.video_maintain_aspect_ratio=true \
+  ++policy.megatron_cfg.optimizer.min_lr="${MIN_LR}" \
+  ++policy.megatron_cfg.scheduler.lr_decay_iters="${LR_DECAY_ITERS}" \
+  ++policy.megatron_cfg.scheduler.lr_decay_style=cosine \
+  policy.generation.temperature="${GENERATION_TEMPERATURE}" \
+  policy.generation.val_temperature="${VAL_GENERATION_TEMPERATURE}" \
   ++policy.generation.backend=vllm \
   ++policy.generation.refit_transport=null \
   ++policy.generation.bad_words="['<image>','<img>','</img>','<so_embedding>','<so_start>','<so_end>']" \

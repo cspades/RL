@@ -15,6 +15,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
+unset VLLM_RUNTIME_PATCH_SCRIPT
+
+# The Megatron policy must be reconverted with the restored vision final norm
+# before its weights are streamed into the vLLM generation model.
+export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-final-ln-v1}"
 
 MODEL_REL="${MODEL_REL:-workspace/models/super-vl-35-video-teacher-step-120/hf}"
 DATA_REL="${DATA_REL:-workspace/datasets/super-vl-35-videoqa}"
@@ -62,6 +67,8 @@ export NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-128}"
 export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-16}"
 export TRAIN_GBS="${TRAIN_GBS:-2048}"
 export MAX_STEPS="${MAX_STEPS:-1000000}"
+export LR_DECAY_ITERS="${LR_DECAY_ITERS:-100000}"
+export MIN_LR="${MIN_LR:-2.0e-9}"
 
 # Rollout-pump concurrency, counted in prompt groups rather than requests.
 # MAX_BUFFERED_ROLLOUTS is how many finished-but-untrained groups may sit in the
@@ -111,9 +118,6 @@ export VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
 export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
 export VLLM_CAP_MAX_TOKENS_TO_CONTEXT="${VLLM_CAP_MAX_TOKENS_TO_CONTEXT:-true}"
 export VLLM_REFIT_TIMEOUT_S="${VLLM_REFIT_TIMEOUT_S:-300}"
-# The image contains vLLM 0.26. Apply the Python-only RADIO final-LayerNorm
-# backport in each generation worker venv instead of replacing its compiled package.
-export VLLM_RUNTIME_PATCH_SCRIPT="${VLLM_RUNTIME_PATCH_SCRIPT:-${CONTAINER_NEMORL}/scripts/patch_vllm_super_omni_radio_layernorm.py}"
 
 # Rows in this manifest carry their media as input_image parts, never as a
 # native video part. Cached rows (35547 of 65474) hold exactly 64 frames tagged
@@ -135,16 +139,22 @@ export VLLM_LIMIT_MM_IMAGES="${VLLM_LIMIT_MM_IMAGES:-64}"
 # manifest ("Cached Gym video frame count does not match vLLM's requested
 # num_frames"), which surfaces as an HTTP 500 on every rollout.
 
-export OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-false}"
-export OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-0.0}"
+# Match the MLLM twin's training-side memory policy. Generation still runs in
+# vLLM; these settings only move the Megatron policy's Adam state to CPU.
+export OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-true}"
+export OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-1.0}"
 export OVERLAP_CPU_OPTIMIZER_D2H_H2D="${OVERLAP_CPU_OPTIMIZER_D2H_H2D:-false}"
 export OFFLOAD_OPTIMIZER_FOR_LOGPROB="${OFFLOAD_OPTIMIZER_FOR_LOGPROB:-false}"
 export USE_PRECISION_AWARE_OPTIMIZER="${USE_PRECISION_AWARE_OPTIMIZER:-false}"
 export OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-false}"
 export OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-false}"
 export EMPTY_UNUSED_MEMORY_LEVEL="${EMPTY_UNUSED_MEMORY_LEVEL:-2}"
+# Avoid allocator fragmentation as packed training sequence sizes vary.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-false}"
+export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-true}"
+export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-5}"
+export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-2}"
 export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-videoqa-vllm-v2}"
 export VIDEO_TEACHER_RESULTS_DIR="${VIDEO_TEACHER_RESULTS_DIR:-${RESULTS_DIR}}"
 export VIDEO_TEACHER_GYM_VENV_DIR="${VIDEO_TEACHER_GYM_VENV_DIR:-${CONTAINER_NEMORL}/workspace/gym_venvs/super-vl-35-videoqa}"
@@ -186,10 +196,14 @@ export EXTRA_OVERRIDES="\
 ++policy.megatron_cfg.moe_router_bias_update_rate=0.0 \
 ++policy.megatron_cfg.mtp_use_repeated_layer=false \
 ++policy.megatron_cfg.mtp_detach_heads=false \
+++policy.megatron_cfg.optimizer.min_lr=${MIN_LR} \
+++policy.megatron_cfg.scheduler.lr_decay_iters=${LR_DECAY_ITERS} \
+++policy.megatron_cfg.scheduler.lr_decay_style=cosine \
+++grpo.overlong_filtering=true \
 ++policy.router_replay.enabled=false \
-++policy.hf_config_overrides.video_temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
-++policy.hf_config_overrides.video_target_num_patches=${VIDEO_TARGET_PATCHES} \
-++policy.hf_config_overrides.video_maintain_aspect_ratio=false \
+++policy.sequence_packing.train_mb_tokens=${TRAIN_MB_TOKENS} \
+++policy.sequence_packing.logprob_mb_tokens=${LOGPROB_MB_TOKENS} \
+++policy.sequence_packing.microbatch_order=largest_first \
 ++policy.generation.vllm_cfg.max_model_len=${MAX_SEQUENCE_LENGTH} \
 ++policy.generation.vllm_cfg.video.sampling_style=nemotron_vl \
 ++policy.generation.vllm_cfg.video.num_frames=${NUM_FRAMES} \
@@ -216,6 +230,9 @@ export EXTRA_OVERRIDES="\
 ++async_rl.stall_watchdog.stall_timeout_s=${STALL_WATCHDOG_TIMEOUT_S} \
 ++async_rl.stall_watchdog.stall_action=abort \
 ++checkpointing.checkpoint_dir=${VIDEO_TEACHER_RESULTS_DIR}/checkpoints \
+++checkpointing.save_period=${CHECKPOINT_SAVE_PERIOD} \
+++checkpointing.save_optimizer=true \
+++checkpointing.keep_top_k=${CHECKPOINT_KEEP_TOP_K} \
 ++checkpointing.save_data_plane=true \
 ++logger.log_dir=${VIDEO_TEACHER_RESULTS_DIR}/logs \
 ++logger.wandb.project=${VIDEO_TEACHER_WANDB_PROJECT} \

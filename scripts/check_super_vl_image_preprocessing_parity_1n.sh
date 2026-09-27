@@ -18,6 +18,12 @@ RESIZE_MODE="${RESIZE_MODE:-torch_bicubic_antialias}"
 PIXEL_ATOL="${PIXEL_ATOL:-0}"
 START_ROW="${START_ROW:-0}"
 MAX_ROWS="${MAX_ROWS:-}"
+GEOMETRY_CACHE="${GEOMETRY_CACHE:-false}"
+PAD_DYNAMIC_IMAGE_SHAPES="${PAD_DYNAMIC_IMAGE_SHAPES:-false}"
+VIDEO_NUM_FRAMES="${VIDEO_NUM_FRAMES:-64}"
+VIDEO_TEMPORAL_PATCH_SIZE="${VIDEO_TEMPORAL_PATCH_SIZE:-2}"
+VIDEO_TARGET_NUM_PATCHES="${VIDEO_TARGET_NUM_PATCHES:-1024}"
+VIDEO_MAINTAIN_ASPECT_RATIO="${VIDEO_MAINTAIN_ASPECT_RATIO:-true}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-100}"
 REPORT_LIMIT="${REPORT_LIMIT:-20}"
 
@@ -37,6 +43,9 @@ ARGS=(
   --resize-mode "${RESIZE_MODE}"
   --pixel-atol "${PIXEL_ATOL}"
   --start-row "${START_ROW}"
+  --video-num-frames "${VIDEO_NUM_FRAMES}"
+  --video-temporal-patch-size "${VIDEO_TEMPORAL_PATCH_SIZE}"
+  --video-target-num-patches "${VIDEO_TARGET_NUM_PATCHES}"
   --progress-every "${PROGRESS_EVERY}"
   --report-limit "${REPORT_LIMIT}"
 )
@@ -45,6 +54,15 @@ if [[ -n "${MODEL_LENGTH}" ]]; then
 fi
 if [[ -n "${MAX_ROWS}" ]]; then
   ARGS+=(--max-rows "${MAX_ROWS}")
+fi
+if [[ "${GEOMETRY_CACHE}" == "true" ]]; then
+  ARGS+=(--geometry-cache)
+fi
+if [[ "${PAD_DYNAMIC_IMAGE_SHAPES}" == "true" ]]; then
+  ARGS+=(--pad-dynamic-image-shapes)
+fi
+if [[ "${VIDEO_MAINTAIN_ASPECT_RATIO}" == "true" ]]; then
+  ARGS+=(--video-maintain-aspect-ratio)
 fi
 
 cd "${NEMORL}"

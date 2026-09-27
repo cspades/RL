@@ -143,7 +143,7 @@ def patch_source(source: str) -> tuple[str, bool]:
         final_layernorm_dict = (
             dict(final_layernorm.named_parameters())
             if load_multimodal_weights and final_layernorm is not None
-            else {{}}
+            else {}
         )
 
         def is_llm(name: str) -> bool:
