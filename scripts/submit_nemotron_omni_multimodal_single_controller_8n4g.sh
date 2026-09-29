@@ -84,7 +84,13 @@ if (( INFERENCE_WORLD_SIZE % INFER_TP != 0 || INFERENCE_WORLD_SIZE % INFER_EP !=
   exit 1
 fi
 TRAIN_DP_SIZE=$((TRAIN_WORLD_SIZE / (POLICY_TP * POLICY_CP)))
-INFERENCE_DP_SIZE=$((INFERENCE_WORLD_SIZE / INFER_TP))
+# EP can span more ranks than TP for Megatron inference. Replica-level DP is
+# determined by the larger model-parallel dimension (ETP is fixed to one).
+if (( INFER_EP > INFER_TP )); then
+  INFERENCE_DP_SIZE=$((INFERENCE_WORLD_SIZE / INFER_EP))
+else
+  INFERENCE_DP_SIZE=$((INFERENCE_WORLD_SIZE / INFER_TP))
+fi
 TRAIN_MODEL_PARALLEL_SIZE=$((POLICY_TP * POLICY_CP))
 if (( POLICY_EP > TRAIN_MODEL_PARALLEL_SIZE )); then
   TRAIN_MODEL_PARALLEL_SIZE=${POLICY_EP}

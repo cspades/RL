@@ -118,6 +118,7 @@ export VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
 export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
 export VLLM_CAP_MAX_TOKENS_TO_CONTEXT="${VLLM_CAP_MAX_TOKENS_TO_CONTEXT:-true}"
 export VLLM_REFIT_TIMEOUT_S="${VLLM_REFIT_TIMEOUT_S:-300}"
+export VLLM_TRITON_FORCE_FIRST_CONFIG="${VLLM_TRITON_FORCE_FIRST_CONFIG:-1}"
 
 # Rows in this manifest carry their media as input_image parts, never as a
 # native video part. Cached rows (35547 of 65474) hold exactly 64 frames tagged
@@ -154,7 +155,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-true}"
 export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-5}"
-export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-2}"
+export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-1}"
 export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-videoqa-vllm-v2}"
 export VIDEO_TEACHER_RESULTS_DIR="${VIDEO_TEACHER_RESULTS_DIR:-${RESULTS_DIR}}"
 export VIDEO_TEACHER_GYM_VENV_DIR="${VIDEO_TEACHER_GYM_VENV_DIR:-${CONTAINER_NEMORL}/workspace/gym_venvs/super-vl-35-videoqa}"
@@ -164,7 +165,7 @@ export VIDEO_TEACHER_WANDB_ID="${VIDEO_TEACHER_WANDB_ID:-${VIDEO_TEACHER_WANDB_N
 export WANDB_PROJ="${WANDB_PROJ:-${VIDEO_TEACHER_WANDB_PROJECT}}"
 export WANDB_NAME="${WANDB_NAME:-${VIDEO_TEACHER_WANDB_NAME}}"
 export JOB_NAME="${JOB_NAME:-super-vl-35-videoqa-vllm-v2-32n4g}"
-export SBATCH_TIME="${SBATCH_TIME:-04:00:00}"
+export SBATCH_TIME="${SBATCH_TIME:-08:00:00}"
 export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
 
 # TASK=vstat supplies generic Nano-Omni defaults. Restore the validated Super
