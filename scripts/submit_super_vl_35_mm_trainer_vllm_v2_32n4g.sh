@@ -15,7 +15,7 @@ CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
 # Patch only Python model code in the container's vLLM 0.29 worker environment.
 export VLLM_RUNTIME_PATCH_SCRIPT="${VLLM_RUNTIME_PATCH_SCRIPT:-${CONTAINER_NEMORL}/scripts/patch_vllm_super_omni_radio_layernorm_0_29.py}"
 
-# Keep the restored-final-layernorm conversion separate from the MInf cache.
+# Share one cache root; MBridge keys each unique source model into its own subdirectory.
 export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-35-unified-final-ln-v2}"
 
 MODEL_REL="${MODEL_REL:-workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf}"
@@ -92,7 +92,7 @@ export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-256}"
 
 export MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-65536}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
-export TRAIN_MB_TOKENS="${TRAIN_MB_TOKENS:-65536}"
+export TRAIN_MB_TOKENS="${TRAIN_MB_TOKENS:-49152}"
 export LOGPROB_MB_TOKENS="${LOGPROB_MB_TOKENS:-65536}"
 export NUM_FRAMES="${NUM_FRAMES:-64}"
 export TEMPORAL_PATCH_SIZE="${TEMPORAL_PATCH_SIZE:-2}"
@@ -132,6 +132,7 @@ export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-true}"
 export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-10}"
 export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-1}"
+export CHECKPOINT_ASYNC_SAVE="${CHECKPOINT_ASYNC_SAVE:-false}"
 export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-mm-trainer-vllm-v2}"
 export MM_TRAINER_RESULTS_DIR="${MM_TRAINER_RESULTS_DIR:-${RESULTS_DIR}}"
 export MM_TRAINER_GYM_VENV_DIR="${MM_TRAINER_GYM_VENV_DIR:-/opt/gym_venvs}"
@@ -142,7 +143,7 @@ export MM_TRAINER_WANDB_ID="${MM_TRAINER_WANDB_ID:-${MM_TRAINER_WANDB_NAME}}"
 export WANDB_PROJ="${WANDB_PROJ:-${MM_TRAINER_WANDB_PROJECT}}"
 export WANDB_NAME="${WANDB_NAME:-${MM_TRAINER_WANDB_NAME}}"
 export JOB_NAME="${JOB_NAME:-super-vl-35-mm-trainer-vllm-v2-32n4g}"
-export SBATCH_TIME="${SBATCH_TIME:-08:00:00}"
+export SBATCH_TIME="${SBATCH_TIME:-12:00:00}"
 export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
 
 # Preserve the DSS cache mount used by the V1 run.
@@ -233,6 +234,7 @@ export EXTRA_OVERRIDES="\
 ++checkpointing.keep_top_k=${CHECKPOINT_KEEP_TOP_K} \
 ++checkpointing.save_optimizer=true \
 ++checkpointing.save_data_plane=true \
+++policy.megatron_cfg.checkpoint.async_save=${CHECKPOINT_ASYNC_SAVE} \
 ++logger.log_dir=${MM_TRAINER_RESULTS_DIR}/logs \
 ++logger.tensorboard_enabled=true \
 ++logger.wandb.entity=${MM_TRAINER_WANDB_ENTITY} \
