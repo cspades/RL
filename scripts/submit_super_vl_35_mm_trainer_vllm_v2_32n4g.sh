@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NeMo-RL V2 / SingleController / Megatron-inference port of:
+# NeMo-RL V2 / SingleController / vLLM port of:
 #   gui-grpo-experiments/configs/four_source_video10k_freezevision_20260922.yaml
 #
-# 32 GB200 nodes:
-#   policy:     16 nodes, TP=2 CP=2 EP=16
-#   generation: 16 nodes, TP=2 CP=1 EP=8 (8 MCore replicas)
+# This is the vLLM twin of the Megatron-Inference V2 launcher. It retains the
+# V1 unified-teacher dataset, policy topology, optimizer, schedule, Gym setup,
+# router replay, and one-step asynchronous lookahead.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
+
+# Patch only Python model code in the container's vLLM 0.29 worker environment.
+export VLLM_RUNTIME_PATCH_SCRIPT="${VLLM_RUNTIME_PATCH_SCRIPT:-${CONTAINER_NEMORL}/scripts/patch_vllm_super_omni_radio_layernorm_0_29.py}"
+
+# Keep the restored-final-layernorm conversion separate from the MInf cache.
+export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-35-unified-final-ln-v2}"
 
 MODEL_REL="${MODEL_REL:-workspace/models/super-vl-35-rlvr-v43-falcon-r3-20260905/hf}"
 DATA_REL="${DATA_REL:-workspace/datasets/mm-trainer-unified}"
@@ -54,11 +60,8 @@ for config_path in "${GYM_CONFIGS[@]}"; do
   fi
 done
 
-# Keep this conversion cache separate from the earlier video-teacher checkpoint.
-export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-35-rlvr-v43-falcon-r3}"
-
 export TASK=vstat
-export GENERATION_BACKEND=megatron
+export GENERATION_BACKEND=vllm
 export CONFIG="examples/configs/recipes/vlm/super_vl_35_mm_trainer_megatron_v2.yaml"
 export MODEL_NAME="${MM_TRAINER_MODEL_PATH}"
 export DATA_ROOT="${CONTAINER_NEMORL}/${DATA_REL}"
@@ -72,11 +75,12 @@ export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 export NUM_GEN_NODES="${NUM_GEN_NODES:-16}"
 export SEGMENT_SIZE="${SEGMENT_SIZE:-8}"
 
+# Match the V1 unified-teacher policy and vLLM parallelism.
 export POLICY_TP="${POLICY_TP:-2}"
 export POLICY_CP="${POLICY_CP:-2}"
 export POLICY_EP="${POLICY_EP:-16}"
-export INFER_TP="${INFER_TP:-2}"
-export INFER_EP="${INFER_EP:-8}"
+export INFER_TP="${INFER_TP:-4}"
+export INFER_EP="${INFER_EP:-4}"
 
 export NUM_PROMPTS_PER_STEP="${NUM_PROMPTS_PER_STEP:-128}"
 export NUM_GENERATIONS_PER_PROMPT="${NUM_GENERATIONS_PER_PROMPT:-16}"
@@ -88,23 +92,25 @@ export MAX_BUFFERED_ROLLOUTS="${MAX_BUFFERED_ROLLOUTS:-256}"
 
 export MAX_SEQUENCE_LENGTH="${MAX_SEQUENCE_LENGTH:-65536}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
-export INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-32768}"
-export MIN_GENERATION_TOKENS="${MIN_GENERATION_TOKENS:-32768}"
 export TRAIN_MB_TOKENS="${TRAIN_MB_TOKENS:-65536}"
 export LOGPROB_MB_TOKENS="${LOGPROB_MB_TOKENS:-65536}"
 export NUM_FRAMES="${NUM_FRAMES:-64}"
 export TEMPORAL_PATCH_SIZE="${TEMPORAL_PATCH_SIZE:-2}"
 export VIDEO_TARGET_PATCHES="${VIDEO_TARGET_PATCHES:-1024}"
+export MIN_GENERATION_TOKENS="${MIN_GENERATION_TOKENS:-32768}"
 
-export REFIT_TRANSPORT="${REFIT_TRANSPORT:-mcore}"
-export REFIT_BACKEND="${REFIT_BACKEND:-nccl}"
-export BUFFER_SIZE_GB="${BUFFER_SIZE_GB:-20}"
-export HTTP_SERVER_NUM_REPLICAS="${HTTP_SERVER_NUM_REPLICAS:-8}"
-export MEGATRON_ENABLE_CHUNKED_PREFILL="${MEGATRON_ENABLE_CHUNKED_PREFILL:-true}"
-export ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
-export PREFIX_CACHING_MAMBA_GB="${PREFIX_CACHING_MAMBA_GB:-20}"
-export MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE="${MEGATRON_USE_CUDA_GRAPHS_FOR_NON_DECODE:-true}"
-export MAMBA_INFERENCE_SSM_STATES_DTYPE="${MAMBA_INFERENCE_SSM_STATES_DTYPE:-float32}"
+# Match the V1 vLLM serving configuration.
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.8}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-128}"
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-65536}"
+export VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-false}"
+export VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-false}"
+export VLLM_CAP_MAX_TOKENS_TO_CONTEXT="${VLLM_CAP_MAX_TOKENS_TO_CONTEXT:-true}"
+export VLLM_REFIT_TIMEOUT_S="${VLLM_REFIT_TIMEOUT_S:-300}"
+export VLLM_TRITON_FORCE_FIRST_CONFIG="${VLLM_TRITON_FORCE_FIRST_CONFIG:-1}"
+export VLLM_LIMIT_MM_IMAGES="${VLLM_LIMIT_MM_IMAGES:-64}"
+export MOE_BACKEND="${MOE_BACKEND:-flashinfer_cutlass}"
+export NRL_REFIT_BUFFER_MEMORY_RATIO="${NRL_REFIT_BUFFER_MEMORY_RATIO:-0.006}"
 
 # Match the V1 precision-aware optimizer without changing its FP32 state.
 export USE_PRECISION_AWARE_OPTIMIZER="${USE_PRECISION_AWARE_OPTIMIZER:-true}"
@@ -116,6 +122,7 @@ export OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-0.0}"
 export OFFLOAD_OPTIMIZER_FOR_LOGPROB="${OFFLOAD_OPTIMIZER_FOR_LOGPROB:-false}"
 export OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-false}"
 export OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 export NEMO_GYM_ROLLOUT_TIMEOUT_S="${NEMO_GYM_ROLLOUT_TIMEOUT_S:-2100}"
 export GENERATION_ROUTER_BACKEND_TIMEOUT_S="${GENERATION_ROUTER_BACKEND_TIMEOUT_S:-1800}"
@@ -125,25 +132,22 @@ export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 export CHECKPOINTING_ENABLED="${CHECKPOINTING_ENABLED:-true}"
 export CHECKPOINT_SAVE_PERIOD="${CHECKPOINT_SAVE_PERIOD:-10}"
 export CHECKPOINT_KEEP_TOP_K="${CHECKPOINT_KEEP_TOP_K:-1}"
-export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-mm-trainer-megatron-v2}"
+export RESULTS_DIR="${RESULTS_DIR:-${NEMORL}/workspace/results/super-vl-35-mm-trainer-vllm-v2}"
 export MM_TRAINER_RESULTS_DIR="${MM_TRAINER_RESULTS_DIR:-${RESULTS_DIR}}"
 export MM_TRAINER_GYM_VENV_DIR="${MM_TRAINER_GYM_VENV_DIR:-/opt/gym_venvs}"
 export MM_TRAINER_WANDB_ENTITY="${MM_TRAINER_WANDB_ENTITY:-nvidia}"
 export MM_TRAINER_WANDB_PROJECT="${MM_TRAINER_WANDB_PROJECT:-mllm-v2-super35vl-unified-teacher}"
-export MM_TRAINER_WANDB_NAME="${MM_TRAINER_WANDB_NAME:-super-vl-35-mm-trainer-megatron-v2}"
+export MM_TRAINER_WANDB_NAME="${MM_TRAINER_WANDB_NAME:-super-vl-35-mm-trainer-vllm-v2}"
 export MM_TRAINER_WANDB_ID="${MM_TRAINER_WANDB_ID:-${MM_TRAINER_WANDB_NAME}}"
 export WANDB_PROJ="${WANDB_PROJ:-${MM_TRAINER_WANDB_PROJECT}}"
 export WANDB_NAME="${WANDB_NAME:-${MM_TRAINER_WANDB_NAME}}"
-export JOB_NAME="${JOB_NAME:-super-vl-35-mm-trainer-megatron-v2-32n4g}"
+export JOB_NAME="${JOB_NAME:-super-vl-35-mm-trainer-vllm-v2-32n4g}"
 export SBATCH_TIME="${SBATCH_TIME:-08:00:00}"
 export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
 
-# Preserve the DSS cache mount from the V1 runtime YAML. The generic launcher
-# appends the repository mount after this list.
+# Preserve the DSS cache mount used by the V1 run.
 export MOUNTS="${MOUNTS:-/scratch:/scratch,/lustre:/lustre,/home/svc-dss/cache:/home/svc-dss/cache:ro}"
 
-# TASK=vstat performs the required multimodal worker/bootstrap setup but carries
-# Nano-Omni defaults. These late overrides restore the exact Super-VL contract.
 USER_EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
 export EXTRA_OVERRIDES="\
 ++policy.megatron_cfg.freeze_vision_model=true \
@@ -167,28 +171,39 @@ export EXTRA_OVERRIDES="\
 ++policy.megatron_cfg.scheduler.lr_decay_style=cosine \
 ++policy.megatron_cfg.scheduler.lr_warmup_iters=10 \
 ++policy.megatron_cfg.scheduler.lr_warmup_init=3.0e-8 \
-++policy.router_replay.enabled=false \
+++policy.megatron_cfg.env_vars.NCCL_NVLS_ENABLE=\"'${NCCL_NVLS_ENABLE}'\" \
+++policy.router_replay.enabled=true \
+++token_capture.enabled=true \
+++token_capture.defer_routed_experts_to_policy=false \
 ++policy.sequence_packing.train_mb_tokens=${TRAIN_MB_TOKENS} \
 ++policy.sequence_packing.logprob_mb_tokens=${LOGPROB_MB_TOKENS} \
 ++policy.sequence_packing.microbatch_order=largest_first \
 ++policy.hf_config_overrides.video_temporal_patch_size=${TEMPORAL_PATCH_SIZE} \
 ++policy.hf_config_overrides.video_target_num_patches=${VIDEO_TARGET_PATCHES} \
 ++policy.hf_config_overrides.video_maintain_aspect_ratio=false \
+++policy.generation.temperature=1.0 \
+++policy.generation.top_p=1.0 \
 ++policy.generation.bad_words=\"['<image>','<img>','</img>','<so_embedding>','<so_start>','<so_end>']\" \
-++policy.generation.mcore_generation_config.http_server_num_replicas=${HTTP_SERVER_NUM_REPLICAS} \
-++policy.generation.mcore_generation_config.parsers=[deepseek-r1-reasoning,qwen3-coder-tool] \
-++policy.generation.mcore_generation_config.megatron_inference_wrapper=megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper.NemotronOmniInferenceWrapper \
-++policy.generation.mcore_generation_config.image_dynamic_resolution=true \
-++policy.generation.mcore_generation_config.image_dynamic_resolution_rounding_mode=round_plus_half \
-++policy.generation.mcore_generation_config.image_dynamic_resolution_resize_mode=torch_bicubic_antialias \
-++policy.generation.mcore_generation_config.multimodal_prompt_config.content_part_order=preserve \
-++policy.generation.mcore_generation_config.multimodal_prompt_config.video_spec.expansion_mode=temporal_patch \
-++policy.generation.mcore_generation_config.multimodal_prompt_config.video_spec.include_frame_timestamps_for_nemotron_vl=true \
-++policy.generation.mcore_generation_config.video_maintain_aspect_ratio=false \
+++policy.generation.vllm_cfg.enable_prefix_caching=${VLLM_ENABLE_PREFIX_CACHING} \
+++policy.generation.vllm_cfg.env_vars.NRL_VLLM_FP32_LM_HEAD=1 \
+++policy.generation.vllm_cfg.env_vars.VLLM_TRITON_FORCE_FIRST_CONFIG=${VLLM_TRITON_FORCE_FIRST_CONFIG} \
+++policy.generation.vllm_kwargs.enable_return_routed_experts=true \
+++policy.generation.vllm_kwargs.limit_mm_per_prompt.image=${VLLM_LIMIT_MM_IMAGES} \
+++policy.generation.vllm_kwargs.limit_mm_per_prompt.video.count=1 \
+++policy.generation.vllm_kwargs.limit_mm_per_prompt.video.num_frames=${NUM_FRAMES} \
+++policy.generation.vllm_kwargs.media_io_kwargs.video.num_frames=${NUM_FRAMES} \
+++policy.generation.vllm_kwargs.max_num_seqs=${VLLM_MAX_NUM_SEQS} \
+++policy.generation.vllm_kwargs.max_num_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS} \
+++policy.generation.vllm_kwargs.enable_chunked_prefill=true \
+++policy.generation.vllm_kwargs.allowed_local_media_path=${NEMO_RL_VIDEO_MEDIA_ROOT} \
+++policy.generation.vllm_kwargs.attention_backend=FLASHINFER \
+++policy.generation.vllm_kwargs.mm_encoder_attn_backend=FLASH_ATTN \
+++policy.generation.vllm_kwargs.compilation_config.backend=eager \
+++policy.generation.vllm_kwargs.compilation_config.cudagraph_mode=PIECEWISE \
 ++data.shuffle=false \
 ++data.num_workers=1 \
+++data.default.video_sampling_style=nemotron_vl \
 ++data.default.video_maintain_aspect_ratio=false \
-++data.default.video_prompt_expansion_mode=temporal_patch \
 ++data.validation=null \
 ++grpo.max_num_epochs=1 \
 ++grpo.max_num_steps=${MAX_STEPS} \
@@ -208,7 +223,7 @@ export EXTRA_OVERRIDES="\
 ++async_rl.generation_router.enabled=true \
 ++async_rl.generation_router.backend_timeout_s=${GENERATION_ROUTER_BACKEND_TIMEOUT_S} \
 ++async_rl.generation_router.connect_timeout_s=5 \
-++async_rl.generation_fleet_health.enabled=false \
+++async_rl.generation_fleet_health.enabled=true \
 ++async_rl.stall_watchdog.stall_timeout_s=${STALL_WATCHDOG_TIMEOUT_S} \
 ++async_rl.stall_watchdog.stall_action=abort \
 ++env.nemo_gym.skip_venv_if_present=true \

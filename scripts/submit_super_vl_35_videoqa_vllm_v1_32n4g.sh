@@ -8,7 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 NEMORL="${NEMORL:-$(cd "${SCRIPT_DIR}/.." && pwd -P)}"
 CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
-unset VLLM_RUNTIME_PATCH_SCRIPT
+# Patch only the Python model source inside each vLLM 0.29 worker environment;
+# retain the container's matching compiled vLLM extension and dependencies.
+export VLLM_RUNTIME_PATCH_SCRIPT="${VLLM_RUNTIME_PATCH_SCRIPT:-${CONTAINER_NEMORL}/scripts/patch_vllm_super_omni_radio_layernorm_0_29.py}"
 
 # The Megatron policy must be reconverted with the restored vision final norm
 # before its weights are streamed into the vLLM generation model.
