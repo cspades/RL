@@ -1018,6 +1018,40 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
+_MINF_CAPTURE_HOOK_PROTOCOLS = ("RequestPayloadStager", "RequestPromptPreparer")
+
+
+def _require_minf_capture_hooks() -> None:
+    """Fail at setup if the pinned megatron-core lacks the MInf capture hooks.
+
+    Megatron token capture installs a ``RequestPayloadStager`` and a
+    ``RequestPromptPreparer`` on ``DynamicInferenceEngine`` (NVIDIA/Megatron-LM
+    PR #7015). Both protocols live in ``megatron.core.inference.inference_request``,
+    so their presence can be checked at config time without building an engine.
+    """
+    try:
+        # Deferred import: megatron-core is a heavy, optional dependency that the
+        # driver venv may not carry at all.
+        from megatron.core.inference import inference_request
+    except ImportError:
+        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
+        # still fails loudly when the engine lacks the hooks.
+        return
+    missing = [
+        name
+        for name in _MINF_CAPTURE_HOOK_PROTOCOLS
+        if not hasattr(inference_request, name)
+    ]
+    if missing:
+        raise NotImplementedError(
+            "Megatron token capture requires the MInf capture hooks from "
+            "NVIDIA/Megatron-LM PR #7015; the pinned megatron-core lacks "
+            f"{', '.join(missing)}. Bump 3rdparty/Megatron-Bridge-workspace/"
+            "Megatron-Bridge to a revision that includes it, or use "
+            "policy.generation.backend=vllm."
+        )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1192,6 +1226,15 @@ def setup_single_controller(
     # nemo_rl/distributed/actor_environments.py), so nothing here needs to
     # change the worker's environment.
     token_capture_cfg = master_config.token_capture
+    if (
+        generation_config["backend"] == "megatron"
+        and router_replay_enabled(master_config.policy)
+        and not token_capture_cfg.enabled
+    ):
+        raise ValueError(
+            "Megatron router replay requires token_capture.enabled=true so "
+            "MInf routing indices can be joined with Gym lineage"
+        )
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1255,11 +1298,16 @@ def setup_single_controller(
                     "Megatron token capture requires policy.generation."
                     "mcore_generation_config.expose_http_server=true"
                 )
-            if router_replay_enabled(master_config.policy):
+            if (
+                router_replay_enabled(master_config.policy)
+                and token_capture_cfg.defer_routed_experts_to_policy
+            ):
                 raise NotImplementedError(
-                    "Megatron token capture does not yet support router replay: "
-                    "the canonical MInf stager does not yet normalize routed experts"
+                    "Megatron token capture does not support "
+                    "token_capture.defer_routed_experts_to_policy yet; MInf "
+                    "routing indices are aligned in the canonical stager"
                 )
+            _require_minf_capture_hooks()
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
         # per-run control-plane bearer token, the process-shared capture

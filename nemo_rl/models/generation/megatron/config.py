@@ -146,6 +146,15 @@ class MCoreGenerationSpecificArgs(TypedDict):
     # processors. Policy recomputation uses raw model logits, so numerical
     # parity checks should select raw_logprobs explicitly.
     logprobs_mode: Literal["processed_logprobs", "raw_logprobs"]
+    # Which sampling kernel MCore uses. "torch" is Megatron-Core's own default
+    # and the one carrying the Gumbel-max exponential-race fix, so it is what
+    # an A/B against another engine should use; "flashinfer" is the faster
+    # kernel. Declared here rather than read from the environment because the
+    # two produce different token streams, and a generation stack that differs
+    # between arms is exactly what these comparisons are trying to rule out.
+    # Note MCore falls back to torch (with a warning) if flashinfer is
+    # requested but not installed.
+    sampling_backend: NotRequired[Literal["torch", "flashinfer"]]
 
     # FP8/MXFP8 for the dedicated (non-colocated) inference model;
     # merged into its `megatron_cfg` by `merged_inference_megatron_cfg`.

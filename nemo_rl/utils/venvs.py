@@ -148,12 +148,21 @@ def _env_builder(
     )
     venv_path = Path(NEMO_RL_VENV_DIR) / venv_name
     python_path = venv_path / "bin" / "python"
-    started_file = venv_path / "STARTED_ENV_BUILDER"
+    # Deliberately a sibling of venv_path, not a file inside it: create_local_venv's
+    # force_rebuild path does `shutil.rmtree(venv_path)`, which would otherwise delete
+    # this coordination marker out from under the very process that just touched it,
+    # opening a window where a second node reads "no one is building" and starts its
+    # own concurrent rmtree/rebuild of the same (multi-node-shared) venv_path -- two
+    # rmtrees racing on the same tree raises FileNotFoundError.
+    started_file = Path(NEMO_RL_VENV_DIR) / f"{venv_name}.STARTED_ENV_BUILDER"
 
     # Skip early return if force_rebuild is True
     if not force_rebuild and python_path.exists():
         logger.info(f"Using existing venv at {venv_path}")
         return str(python_path)
+
+    # Ensure the marker's parent exists before any node touches/checks it.
+    Path(NEMO_RL_VENV_DIR).mkdir(parents=True, exist_ok=True)
 
     # Sleep to stagger node startup
     time.sleep(1 * node_idx)

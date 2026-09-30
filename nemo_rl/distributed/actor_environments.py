@@ -63,8 +63,8 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     ],
     # MegatronPolicyWorker also gets nemo_gym: Megatron token capture
     # (token_capture.enabled with backend=megatron) imports nemo_gym inside the
-    # worker process via TQMegatronTokenStager / TQMegatronPromptPreparer, and the
-    # cached venv is reused as-is, so the extra has to be fixed here. The SFT
+    # worker process through the adapters in generation/megatron/token_capture.py;
+    # the cached venv is reused as-is, so the extra has to be fixed here. The SFT
     # worker subclasses MegatronPolicyWorker and must resolve to the same venv
     # (tests/unit/data/test_energon_sft_v2.py); the value worker never hosts
     # capture and stays on plain "mcore".

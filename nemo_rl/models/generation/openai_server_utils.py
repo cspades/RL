@@ -22,6 +22,7 @@ token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
 so it has no retokenization drift to correct.
 """
 
+from collections.abc import Collection
 from typing import Any
 
 
@@ -31,7 +32,7 @@ def replace_prefix_tokens(
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
     *,
-    eos_token_id: int | None = None,
+    eos_token_id: int | Collection[int] | None = None,
 ) -> list[int]:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
@@ -102,21 +103,24 @@ def replace_prefix_tokens(
         eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
 
-    # The model isn't guaranteed to end on EOS (e.g. it hit max_tokens); chat
-    # templates always add one, so cut the model input to just before its EOS.
-    model_cut_end = len(model_prefix_token_ids)
-    if model_prefix_token_ids[-1] == eos_token_id:
-        model_cut_end -= 1
+    if type(eos_token_id) is int:
+        eos_token_ids = frozenset((eos_token_id,))
+    elif isinstance(eos_token_id, Collection) and eos_token_id and all(
+        type(token_id) is int for token_id in eos_token_id
+    ):
+        eos_token_ids = frozenset(eos_token_id)
+    else:
+        raise ValueError("EOS token IDs must be an integer or non-empty collection of integers")
 
     # Locate the turn boundary by EOS count rather than token position. Qwen3
     # templates may strip prior reasoning blocks when re-rendering history;
     # EOS counting preserves the original generated reasoning tokens without
     # requiring a customized chat template.
-    count_needed = template_prefix_token_ids.count(eos_token_id)
+    count_needed = sum(token_id in eos_token_ids for token_id in template_prefix_token_ids)
     count_seen = 0
     template_cut_start = -1
     for pos, tid in enumerate(template_token_ids):
-        if tid == eos_token_id:
+        if tid in eos_token_ids:
             count_seen += 1
             if count_seen == count_needed:
                 template_cut_start = pos
@@ -136,6 +140,9 @@ def replace_prefix_tokens(
             )
         raise AssertionError(message)
 
-    return (
-        model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]
-    )
+    template_suffix = template_token_ids[template_cut_start:]
+    if model_prefix_token_ids[-1] in eos_token_ids:
+        # Preserve the exact EOS emitted by the model. The rendered suffix
+        # starts with its own boundary EOS, which may be a different accepted ID.
+        template_suffix = template_suffix[1:]
+    return model_prefix_token_ids + template_suffix

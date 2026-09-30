@@ -40,13 +40,60 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
     resolve_admission_prefix,
 )
+from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+)
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 if TYPE_CHECKING:
     from megatron.core.inference.inference_request import (
         RequestPayloadStageResult,
         RequestPromptPreparationResult,
     )
+
+
+def _delta_align_minf_routing_indices(
+    routing_indices: Any,
+    *,
+    total_tokens: int,
+    prev_len: int,
+) -> torch.Tensor:
+    """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout."""
+    if not 0 <= prev_len <= total_tokens:
+        raise ValueError(
+            f"MInf route prev_len must be in [0, {total_tokens}], got {prev_len}"
+        )
+    routes = torch.as_tensor(routing_indices)
+    if routes.dim() != 3:
+        raise ValueError(
+            "MInf routing_indices must have shape [tokens, layers, topk], "
+            f"got {tuple(routes.shape)}"
+        )
+    expected_routes = total_tokens - 1
+    if routes.shape[0] != expected_routes:
+        raise ValueError(
+            "MInf routing_indices must contain one row for every non-final token: "
+            f"got {routes.shape[0]}, expected {expected_routes}"
+        )
+    if routes.shape[1] <= 0 or routes.shape[2] <= 0:
+        raise ValueError(
+            "MInf routing_indices layer and top-k dimensions must be positive"
+        )
+    if routes.dtype not in (torch.int8, torch.int16, torch.int32):
+        raise ValueError(
+            "MInf routing_indices must use int8, int16, or int32 storage, "
+            f"got {routes.dtype}"
+        )
+    aligned = torch.full(
+        (total_tokens, routes.shape[1], routes.shape[2]),
+        ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+        dtype=routes.dtype,
+        device=routes.device,
+    )
+    if expected_routes:
+        aligned[:-1].copy_(routes)
+    return aligned[prev_len:]
 
 
 class TQMegatronPromptPreparer:
@@ -75,6 +122,8 @@ class TQMegatronPromptPreparer:
         # it defers the prefix splice to this preparer.
         from megatron.core.inference.inference_request import (
             PREFIX_EOS_TOKEN_ID_FIELD,
+            PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+            PREFIX_MEDIA_COUNT_FIELD,
             PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
             RequestPromptPreparationResult,
         )
@@ -125,8 +174,15 @@ class TQMegatronPromptPreparer:
                 raise ValueError(
                     "MInf capture request carries no valid template prefix tokens"
                 )
-            if type(eos_token_id) is not int:
-                raise ValueError("MInf capture request carries no valid EOS token id")
+            if not (
+                type(eos_token_id) is int
+                or (
+                    isinstance(eos_token_id, list)
+                    and eos_token_id
+                    and all(type(token_id) is int for token_id in eos_token_id)
+                )
+            ):
+                raise ValueError("MInf capture request carries no valid EOS token IDs")
             # Same splice as the vLLM worker (vllm_worker_async.py); the
             # post-condition below verifies the result.
             prompt = replace_prefix_tokens(
@@ -143,6 +199,18 @@ class TQMegatronPromptPreparer:
 
         if prompt[: admission.prev_len] != prefix_token_ids:
             raise ValueError("MInf failed to apply the authorized token prefix")
+        if PREFIX_MEDIA_COUNT_FIELD in updated_offload_params:
+            prefix_media_count = updated_offload_params[PREFIX_MEDIA_COUNT_FIELD]
+            if type(prefix_media_count) is not int or prefix_media_count < 0:
+                raise ValueError(
+                    "MInf capture request carries an invalid prefix media count"
+                )
+            # The staged prefix consists of authoritative model-input tokens, so
+            # its media placeholders are already expanded. MCore uses this split
+            # point to expand only the compact current-turn suffix.
+            updated_offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] = len(
+                prefix_token_ids
+            )
         return RequestPromptPreparationResult(
             prompt=prompt, offload_params=updated_offload_params
         )
@@ -157,19 +225,26 @@ class TQMegatronTokenStager:
     canonical TQ row as vLLM, and returns lightweight commit coordinates.
     """
 
-    def __init__(self, sink: TQTokenSink) -> None:
+    def __init__(
+        self,
+        sink: TQTokenSink,
+        *,
+        require_routed_experts: bool = False,
+    ) -> None:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.megatron import (
             MegatronCaptureAdapter,
         )
         from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 
+        self._adapter = MegatronCaptureAdapter()
         self._capture = RolloutTokenCapture(
             sink=sink,
             # MInf passes the authoritative version explicitly for every call.
             weight_version_fn=lambda: 0,
-            adapter=MegatronCaptureAdapter(),
+            adapter=self._adapter,
         )
+        self._require_routed_experts = require_routed_experts
         # Requests that straddled a refit (more than one policy_epoch boundary).
         # Metered here because they are stamped, not masked; see _weight_version.
         self._epoch_span_count = 0
@@ -262,12 +337,42 @@ class TQMegatronTokenStager:
             admission,
             weight_version=self._weight_version(finished_metadata),
         )
-        # Gym's MegatronCaptureAdapter reads prompt/generated ids and log
-        # probs off the offloaded payload. A malformed payload poisons the
-        # call with ``capture_failed`` coordinates (surfacing in Gym as
-        # ``worker_capture_failed``, matching vLLM) instead of raising here,
-        # which would leave Gym with no coordinates at all.
-        coords = self._capture.complete_call_from_response(call, payload)
+        try:
+            prompt_token_ids = self._adapter.extract_prompt_ids(payload)
+            generated_token_ids, generated_logprobs = (
+                self._adapter.extract_generation(payload)
+            )
+            routing_indices = getattr(payload, "routing_indices", None)
+            if routing_indices is None and self._require_routed_experts:
+                raise ValueError(
+                    "MInf offloaded payload carries no routing_indices while router "
+                    "replay is enabled"
+                )
+            extras = None
+            if routing_indices is not None:
+                routed_experts = _delta_align_minf_routing_indices(
+                    routing_indices,
+                    total_tokens=len(prompt_token_ids) + len(generated_token_ids),
+                    prev_len=admission.prev_len,
+                )
+                extras = {"routed_experts": encode_routed_experts(routed_experts)}
+        except Exception:  # noqa: BLE001 — extraction failure poisons capture only
+            logging.getLogger(__name__).exception(
+                "MInf token extraction failed for rollout %s call %s",
+                call.rollout_id,
+                call.model_call_id,
+            )
+            coords = self._capture.fail_call(
+                call, reason="megatron_payload_staging_failed"
+            )
+        else:
+            coords = self._capture.complete_call(
+                call,
+                prompt_token_ids=prompt_token_ids,
+                generated_token_ids=generated_token_ids,
+                generated_logprobs=generated_logprobs,
+                extras=extras,
+            )
         # Deferred: Megatron-LM's inference hooks are only present on the
         # Megatron generation backend (see prepare_prompt); nemo_gym is an
         # optional extra absent in non-gym runs.

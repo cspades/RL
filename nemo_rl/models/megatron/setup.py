@@ -1404,6 +1404,18 @@ def _apply_mtp_config(model_cfg: Any, config: PolicyConfig) -> None:
         # mtp_use_repeated_layer is False) and the number of times the MTP layer
         # is repeated (when mtp_use_repeated_layer is True).
         model_cfg.mtp_num_layers = megatron_cfg["mtp_num_layers"]
+        if megatron_cfg["mtp_num_layers"] == 0:
+            # The checkpoint may still describe a repeated MTP section. Remove
+            # every source of that section so provider finalization cannot build
+            # an MTP head while the runtime configuration says MTP is disabled.
+            if getattr(model_cfg, "mtp_hybrid_override_pattern", None):
+                model_cfg.mtp_hybrid_override_pattern = None
+            if getattr(model_cfg, "mtp_use_repeated_layer", False):
+                model_cfg.mtp_use_repeated_layer = False
+            for pattern_attr in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+                pattern = getattr(model_cfg, pattern_attr, None)
+                if isinstance(pattern, str) and "/" in pattern:
+                    setattr(model_cfg, pattern_attr, pattern.split("/")[0])
     if "mtp_loss_scaling_factor" in megatron_cfg:
         model_cfg.mtp_loss_scaling_factor = megatron_cfg["mtp_loss_scaling_factor"]
     if "mtp_use_repeated_layer" in megatron_cfg:

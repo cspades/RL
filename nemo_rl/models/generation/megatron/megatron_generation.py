@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from copy import deepcopy
+import logging
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -44,6 +45,9 @@ if TYPE_CHECKING:
     from nemo_rl.distributed.worker_groups import RayWorkerGroup
     from nemo_rl.models.policy.lm_policy import Policy
     from nemo_rl.weight_sync.membership import RefitMembership
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MegatronGeneration(GenerationInterface):

@@ -167,13 +167,12 @@ def _broadcast_batched_data_dict(
                 dtype = getattr(torch, dtype_str.split(".")[-1])
                 tensor = torch.empty(shape, dtype=dtype, device=bcast_device)
                 out[key] = tensor
-            # NCCL has no int16 ("Short") type; ship as int32 and narrow back
-            # (routed_experts rides TQ as int16).
+            # NCCL has no int16 ("Short") type. Broadcast its bytes through a
+            # zero-copy uint8 view instead of widening to int32: routed_experts
+            # can be many GiB, and the widened temporary can exhaust the GPU.
             if tensor.dtype == torch.int16:
-                wire = tensor.to(torch.int32)
+                wire = tensor.view(torch.uint8)
                 torch.distributed.broadcast(wire, src=src, group=group)
-                tensor = wire.to(torch.int16)
-                out[key] = tensor
             else:
                 torch.distributed.broadcast(tensor, src=src, group=group)
             # Restore non-leader tensors to the leader's source device
@@ -209,9 +208,10 @@ def _broadcast_batched_data_dict(
                 tensor = torch.empty(numel, dtype=dtype, device=bcast_device)
             if tensor.numel():
                 if tensor.dtype == torch.int16:
-                    wire = tensor.to(torch.int32)
+                    # Preserve the int16 storage and broadcast its raw bytes;
+                    # widening this payload doubles peak device memory.
+                    wire = tensor.view(torch.uint8)
                     torch.distributed.broadcast(wire, src=src, group=group)
-                    tensor = wire.to(torch.int16)
                     del wire
                 else:
                     torch.distributed.broadcast(tensor, src=src, group=group)

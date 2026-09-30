@@ -114,6 +114,22 @@ response. Gym consequently commits an ordinary token-free `CallRecord` before
 the response is released to the agent. No local metadata ledger or rollout-end
 conversion is involved in the active path.
 
+### MInf router replay
+
+With `policy.router_replay.enabled=true`, MInf records selected top-k expert
+identities for every participating MoE layer. Its native payload has shape
+`[T - 1, L, K]`: the final sampled token has no row because it never enters a
+subsequent inference forward pass. Gym's staged-call contract instead requires
+one route row for every token in the call delta.
+
+`TQMegatronTokenStager` appends an all-`-1` terminal row to form
+`[T, L, K]`, then slices from the admission's `prev_len`. The resulting
+`[delta_len, L, K]` tensor is encoded and committed as the digest-bound
+`routed_experts` extra. `-1` is the replay fallback sentinel: at that position
+the trainer uses its current router. MInf does not support
+`token_capture.defer_routed_experts_to_policy=true`; its route plan is resolved
+by the finalizer and published in the canonical training row.
+
 ![Token capture custody](../assets/token-capture-ledger-queue-data-flow.png)
 
 ## Framework-owned receipt and cleanup

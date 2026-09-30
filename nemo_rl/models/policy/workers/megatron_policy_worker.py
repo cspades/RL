@@ -100,6 +100,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 from nemo_rl.models.megatron.router_replay import (
     router_replay_dimensions,
     router_replay_enabled,
+    sync_inference_router_replay_mtp_exclusion,
 )
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
@@ -485,8 +486,8 @@ class MegatronPolicyWorkerImpl(
         }
 
     def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return route dimensions from the initialized Megatron model config."""
-        return router_replay_dimensions(self._get_model_config())
+        """Return route dimensions from the initialized Megatron model."""
+        return router_replay_dimensions(self.model)
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
@@ -619,6 +620,8 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        if self._router_replay_enabled:
+            sync_inference_router_replay_mtp_exclusion()
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
@@ -4277,6 +4280,7 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
             and self.offload_optimizer_for_logprob
         ):
+            self.finalize_async_save()
             self.move_optimizer("cpu")
 
         # No teacher projection happens during logprob inference, so the head can
@@ -4505,6 +4509,7 @@ class MegatronPolicyWorkerImpl(
             and not self.optimizer_cpu_offload
             and self.offload_optimizer_for_refit
         ):
+            self.finalize_async_save()
             self.move_optimizer("cpu")
 
         gc.collect()
@@ -4735,22 +4740,34 @@ class MegatronPolicyWorkerImpl(
         ckpt_cfg = self.mcore_state.cfg.checkpoint
         generation_cfg = self.cfg.get("generation") or {}
         colocated_cfg = generation_cfg.get("colocated") or {}
+        storage_can_move = bool(
+            colocated_cfg.get("enabled", False)
+            or (
+                getattr(self, "optimizer", None) is not None
+                and not self.optimizer_cpu_offload
+                and (
+                    self.offload_optimizer_for_refit
+                    or self.offload_optimizer_for_logprob
+                )
+            )
+        )
         return bool(
             ckpt_cfg.async_save
+            and getattr(ckpt_cfg, "async_strategy", "nvrx") == "nvrx"
             and getattr(ckpt_cfg, "use_persistent_ckpt_worker", False)
             and getattr(ckpt_cfg, "ckpt_assume_constant_structure", False)
             and not getattr(ckpt_cfg, "async_ckpt_use_cpu_shm", False)
-            and colocated_cfg.get("enabled", False)
+            and storage_can_move
         )
 
     def finalize_async_save(self):
-        """Finalize an async write and release unsafe colocated CUDA IPC caches.
+        """Finalize an async write and release CUDA IPC caches that may be stale.
 
         NVRx constant-structure saves cache CUDA tensor handles in the persistent
-        writer. That is safe while model/optimizer storage stays fixed, but a
-        colocated policy replaces that storage during CPU offload. In that case,
-        close the completed writer and invalidate its training-side cache; NVRx
-        starts a fresh persistent writer lazily for the next checkpoint.
+        writer. That is safe while model/optimizer storage stays fixed, but any
+        CPU offload replaces that storage. In that case, close the completed
+        writer and invalidate its training-side cache; NVRx starts a fresh
+        persistent writer lazily for the next checkpoint.
         """
         release_cuda_cache = bool(
             self._async_checkpoint_cuda_cache_active
@@ -4763,7 +4780,17 @@ class MegatronPolicyWorkerImpl(
             terminate=release_cuda_cache,
         )
         if release_cuda_cache:
-            FileSystemWriterAsync.cleanup_tensor_caches()
+            cleanup_tensor_caches = getattr(
+                FileSystemWriterAsync, "cleanup_tensor_caches", None
+            )
+            if cleanup_tensor_caches is not None:
+                cleanup_tensor_caches()
+            else:
+                cached_identifiers = getattr(
+                    FileSystemWriterAsync, "_cached_identifiers", None
+                )
+                if cached_identifiers is not None:
+                    cached_identifiers.clear()
             gc.collect()
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()

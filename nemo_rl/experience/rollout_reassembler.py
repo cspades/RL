@@ -417,7 +417,7 @@ class RolloutReassembler:
             record
             for receipt in receipts
             if isinstance(receipt, dict)
-            for record in (receipt.get("manifest") or [])
+            for record in receipt.get("manifest") or []
             if isinstance(record, dict)
         ]
         if manifest_rows:

@@ -100,6 +100,7 @@ from nemo_rl.models.megatron.memory_saver import (
     pause_inference_weights,
     resume_inference_weights,
 )
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
 from nemo_rl.weight_sync.nccl_reshard_utils import (
@@ -611,7 +612,9 @@ class MegatronGenerationMixin:
             "static_kv_memory_pointers": needs_static_kv_pointers,
             "use_cuda_graphs_for_non_decode_steps": use_cuda_graphs_for_non_decode_steps,
             "use_flashinfer_fused_rope": use_flashinfer_fused_rope,
-            "sampling_backend": "flashinfer",
+            "sampling_backend": mcore_generation_config.get(
+                "sampling_backend", "flashinfer"
+            ),
             "use_synchronous_zmq_collectives": True,
             "materialize_only_last_token_logits": materialize_only_last_token_logits,
             "enable_chunked_prefill": enable_chunked_prefill,
@@ -1034,8 +1037,14 @@ class MegatronGenerationMixin:
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer
+        stager_kwargs = (
+            {"require_routed_experts": True}
+            if router_replay_enabled(self.cfg)
+            else {}
+        )
         stager = TQMegatronTokenStager(
-            TQTokenSink(dp_client, staging_partition=staging_partition)
+            TQTokenSink(dp_client, staging_partition=staging_partition),
+            **stager_kwargs,
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager

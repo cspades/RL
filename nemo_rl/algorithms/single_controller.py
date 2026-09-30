@@ -70,6 +70,7 @@ from typing import (
 
 import ray
 import torch
+import torch.nn.functional as F
 from ray.exceptions import RayActorError
 
 from nemo_rl.algorithms import opd as opd_module
@@ -136,11 +137,20 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
-from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
+    PackedTensor,
+    encode_multimodal_for_wire,
+    multimodal_row_tags,
+    present_multimodal_fields,
+)
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     KVBatchMeta,
 )
+from nemo_rl.data_plane.codec import pack_jagged_fields
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
@@ -1715,6 +1725,126 @@ class SingleControllerActor:
         ) as cut:
             await self._cleanup_known_finalization_request_unlocked(cut, request)
 
+    async def _enrich_finalized_multimodal_fields(
+        self,
+        meta: KVBatchMeta,
+        prompt_payload: DatumSpec,
+    ) -> KVBatchMeta:
+        """Attach the retained prompt's policy-ready media to canonical rows.
+
+        Token capture rebuilds exact model tokens and routes from lightweight
+        staging receipts, while the recovery ledger retains the large static
+        media payload controller-side. Duplicate that one prompt payload across
+        its sibling generations only at the final wire boundary, before the
+        replay slot becomes ready.
+        """
+        message_log = prompt_payload.get("message_log")
+        if not isinstance(message_log, list) or not message_log:
+            return meta
+        if meta.sequence_lengths is None:
+            raise ValueError("finalized multimodal rows require sequence lengths")
+
+        sample_count = meta.size
+        flat_prompt, prompt_lengths = batched_message_log_to_flat_message(
+            [message_log] * sample_count
+        )
+        multimodal = flat_prompt.get_multimodal_dict(as_tensors=False)
+        if not multimodal:
+            return meta
+        if prompt_lengths.numel() != sample_count:
+            raise ValueError(
+                "retained prompt multimodal rows do not align with finalized samples"
+            )
+
+        sequence_lengths = torch.tensor(meta.sequence_lengths, dtype=torch.long)
+        prompt_lengths = prompt_lengths.to(dtype=torch.long)
+        # Structurally invalid captured rollouts are intentionally published as
+        # one-token, sample-masked placeholders. They borrow a sibling's prompt
+        # ids only for advantage grouping and therefore must not borrow its
+        # media payload or per-token media maps. A real finalized row always
+        # contains its complete prompt, so this comparison cleanly separates
+        # placeholders without another data-plane read.
+        media_rows = prompt_lengths <= sequence_lengths
+        if not bool(torch.any(media_rows)):
+            return meta
+
+        for field_name, value in list(multimodal.items()):
+            if field_name in PACKED_MULTIMODAL_FIELDS:
+                if not isinstance(value, PackedTensor) or len(value) != sample_count:
+                    raise ValueError(
+                        f"{field_name!r} must have one packed row per finalized sample"
+                    )
+                multimodal[field_name] = PackedTensor.concat(
+                    [
+                        (
+                            value.slice([row])
+                            if bool(media_rows[row])
+                            else PackedTensor.empty_rows_like(value, 1)
+                        )
+                        for row in range(sample_count)
+                    ]
+                )
+            elif field_name in PER_TOKEN_MULTIMODAL_FIELDS:
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(f"{field_name!r} must be a tensor")
+                value = value.clone()
+                value[~media_rows] = 0
+                multimodal[field_name] = value
+
+        max_sequence_length = int(sequence_lengths.max().item())
+        wire_fields: dict[str, torch.Tensor] = {}
+        for field_name, value in multimodal.items():
+            wire_value = encode_multimodal_for_wire(field_name, value)
+            if wire_value is None:
+                continue
+            if field_name in PER_TOKEN_MULTIMODAL_FIELDS:
+                if wire_value.dim() < 2 or wire_value.shape[0] != sample_count:
+                    raise ValueError(
+                        f"{field_name!r} must have one per-token row per finalized sample"
+                    )
+                if wire_value.shape[1] > max_sequence_length:
+                    raise ValueError(
+                        f"{field_name!r} prompt width {wire_value.shape[1]} exceeds "
+                        f"finalized sequence width {max_sequence_length}"
+                    )
+                wire_value = F.pad(
+                    wire_value,
+                    (0, max_sequence_length - wire_value.shape[1]),
+                )
+            wire_fields[field_name] = wire_value
+
+        if not wire_fields:
+            return meta
+        fields = pack_jagged_fields(
+            wire_fields,
+            lengths=sequence_lengths,
+            token_aligned_fields=PER_TOKEN_MULTIMODAL_FIELDS,
+        )
+        multimodal_tags = multimodal_row_tags(multimodal, sample_count)
+        merged_tags = [dict(tag) for tag in (meta.tags or [{} for _ in range(sample_count)])]
+        if multimodal_tags is not None:
+            for existing, media in zip(merged_tags, multimodal_tags):
+                duplicate_keys = existing.keys() & media.keys()
+                if duplicate_keys:
+                    raise ValueError(
+                        "finalized row already carries multimodal geometry tags: "
+                        f"{sorted(duplicate_keys)!r}"
+                    )
+                existing.update(media)
+
+        await call_data_plane(
+            self._dp_client,
+            "put_samples",
+            offload_sync=True,
+            sample_ids=meta.sample_ids,
+            partition_id=meta.partition_id,
+            fields=fields,
+            tags=merged_tags,
+        )
+        enriched = meta.with_fields(list(wire_fields))
+        enriched.tags = merged_tags
+        return enriched
+
     async def _finalize_with_actor(
         self, request: "ReassemblyRequest"
     ) -> Optional["FinalizedGroup"]:
@@ -1808,6 +1938,13 @@ class SingleControllerActor:
                     )
                 else:
                     try:
+                        prompt_payload = ledger.get_group(
+                            request.group_id
+                        ).prompt_payload
+                        finalized.meta = await self._enrich_finalized_multimodal_fields(
+                            finalized.meta,
+                            prompt_payload,
+                        )
                         await self._buffer.commit_finalized(
                             cut,
                             request.group_id,
