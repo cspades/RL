@@ -1263,13 +1263,22 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     return response
 
-                if request.logprobs and return_as_token_id:
+                token_information_requested = bool(
+                    request.logprobs and return_as_token_id
+                )
+                if token_information_requested:
                     response = attach_token_information_to_chat_response_choices(
                         response,
                         final_res,
                     )
 
-                if worker_self._return_routed_experts_enabled():
+                # routed_experts is part of Gym's atomic training-token
+                # metadata. Do not attach it to ordinary agent/tool calls that
+                # did not request the accompanying token IDs and logprobs.
+                if (
+                    token_information_requested
+                    and worker_self._return_routed_experts_enabled()
+                ):
                     response = attach_routed_experts_to_chat_response_choices(
                         response,
                         final_res,

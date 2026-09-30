@@ -11,7 +11,8 @@ CONTAINER_NEMORL="${CONTAINER_NEMORL:-/opt/nemo-rl}"
 
 # Do not reuse Super-VL checkpoints converted before MBridge restored the
 # trained post-RADIO final LayerNorm.
-export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-final-ln-v1}"
+# MBridge keys each unique source model under this shared Super-VL cache root.
+export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-35-unified-final-ln-v2}"
 
 MODEL_REL="${MODEL_REL:-workspace/models/super-vl-35-video-teacher-step-120/hf}"
 DATA_REL="${DATA_REL:-workspace/datasets/super-vl-35-videoqa}"

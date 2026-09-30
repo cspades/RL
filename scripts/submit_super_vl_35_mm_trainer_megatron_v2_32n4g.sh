@@ -54,8 +54,8 @@ for config_path in "${GYM_CONFIGS[@]}"; do
   fi
 done
 
-# Keep this conversion cache separate from the earlier video-teacher checkpoint.
-export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-35-rlvr-v43-falcon-r3}"
+# Share one cache root; MBridge keys each unique source model into its own subdirectory.
+export NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-${NEMORL}/workspace/cache/nemo-rl-omni/megatron-checkpoints-super-vl-35-unified-final-ln-v2}"
 
 export TASK=vstat
 export GENERATION_BACKEND=megatron
