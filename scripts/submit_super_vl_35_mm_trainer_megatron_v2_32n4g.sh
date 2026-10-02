@@ -135,7 +135,8 @@ export MM_TRAINER_WANDB_ID="${MM_TRAINER_WANDB_ID:-${MM_TRAINER_WANDB_NAME}}"
 export WANDB_PROJ="${WANDB_PROJ:-${MM_TRAINER_WANDB_PROJECT}}"
 export WANDB_NAME="${WANDB_NAME:-${MM_TRAINER_WANDB_NAME}}"
 export JOB_NAME="${JOB_NAME:-super-vl-35-mm-trainer-megatron-v2-32n4g}"
-export SBATCH_TIME="${SBATCH_TIME:-08:00:00}"
+export SBATCH_TIME="${SBATCH_TIME:-12:00:00}"
+export CHECKPOINT_MUST_SAVE_BY="${CHECKPOINT_MUST_SAVE_BY:-00:11:45:00}"
 export CONTAINER="${CONTAINER:-/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/asolergibert/RL/images/nemo-rl-nightly-gym.sqsh}"
 
 # Preserve the DSS cache mount from the V1 runtime YAML. The generic launcher
@@ -214,6 +215,7 @@ export EXTRA_OVERRIDES="\
 ++env.nemo_gym.skip_venv_if_present=true \
 ++env.nemo_gym.nemo_gym_log_dir=${MM_TRAINER_RESULTS_DIR}/logs/nemo_gym \
 ++checkpointing.checkpoint_dir=${MM_TRAINER_RESULTS_DIR}/checkpoints \
+++checkpointing.checkpoint_must_save_by=${CHECKPOINT_MUST_SAVE_BY} \
 ++checkpointing.save_period=${CHECKPOINT_SAVE_PERIOD} \
 ++checkpointing.keep_top_k=${CHECKPOINT_KEEP_TOP_K} \
 ++checkpointing.save_optimizer=true \
