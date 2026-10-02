@@ -570,7 +570,9 @@ fi
 export COMMAND="\
 set -euo pipefail
 NRL_SLURM_JOB_ID=\$(basename \"\$(dirname \"\$0\")\")
-NRL_SLURM_JOB_ID=\${NRL_SLURM_JOB_ID%%-*}
+# Keep the launcher's retry suffix (for example, 7616751-1) so a requeued
+# allocation gets a distinct W&B identity while resume=never remains enabled.
+NRL_SLURM_JOB_ID=\${NRL_SLURM_JOB_ID%-logs}
 cd ${CONTAINER_NEMORL}
 export TASK=${TASK}
 export NEMORL=${CONTAINER_NEMORL}
